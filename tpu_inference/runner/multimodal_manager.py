@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
@@ -166,9 +167,20 @@ class MultiModalManager:
 
             self.runner.encoder_cache[mm_hash] = output
 
-    def gather_mm_embeddings(self, scheduler_output: "VllmSchedulerOutput",
-                             target_pad_len: int) -> list[jax.Array]:
+    def gather_mm_embeddings(
+            self, scheduler_output: "VllmSchedulerOutput",
+            target_pad_len: int) -> tuple[jax.Array | None, jax.Array | None]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        assert (
+            target_pad_len >= total_num_scheduled_tokens
+        ), f"{target_pad_len=} should >= {total_num_scheduled_tokens=} for output is_mm_embedded"
+
         mm_embeds: list[jax.Array] = []
+        is_mm_embed_cpu = np.zeros((total_num_scheduled_tokens, ),
+                                   dtype=np.bool_)
+
+        req_start_idx = 0
+
         for req_id in self.runner.input_batch.req_ids:
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
                 req_id]
@@ -195,7 +207,8 @@ class MultiModalManager:
                 start_idx = max(num_computed_tokens - start_pos, 0)
                 end_idx = min(
                     num_computed_tokens - start_pos + num_scheduled_tokens,
-                    num_encoder_tokens)
+                    num_encoder_tokens,
+                )
                 assert start_idx < end_idx
                 curr_embeds_start, curr_embeds_end = (
                     pos_info.get_embeds_indices_in_range(start_idx, end_idx))
@@ -204,8 +217,7 @@ class MultiModalManager:
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.runner.encoder_cache.get(mm_hash, None)
-                assert encoder_output is not None,\
-                      f"Encoder cache miss for {mm_hash}."
+                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
                 encoder_output = self.runner.encoder_cache[mm_hash]
 
                 if (is_embed := pos_info.is_embed) is not None:
@@ -216,15 +228,34 @@ class MultiModalManager:
                     mm_embeds_item = encoder_output[start_idx:end_idx]
 
                 mm_embeds.append(mm_embeds_item)
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+
+                # use cpu numpy array for inplace modification
+                if is_embed is None:
+                    is_mm_embed_cpu[req_start_pos + start_idx:req_start_pos +
+                                    end_idx] = True
+                else:
+                    # is_embed is torch Tensor in cpu
+                    is_mm_embed_cpu[req_start_pos + start_idx:req_start_pos +
+                                    end_idx] |= is_embed.numpy()
+
+                req_start_idx += num_scheduled_tokens
         if not mm_embeds:
-            return None
+            return None, None
         flattened_embeds = flatten_embeddings(mm_embeds)
         if flattened_embeds.shape[0] == 0:
-            return None
+            return None, None
 
-        padding = jnp.zeros((target_pad_len - flattened_embeds.shape[0],
-                             flattened_embeds.shape[1]),
-                            dtype=flattened_embeds.dtype)
+        padding = jnp.zeros(
+            (target_pad_len - flattened_embeds.shape[0],
+             flattened_embeds.shape[1]),
+            dtype=flattened_embeds.dtype,
+        )
         flattened_embeds = jnp.concatenate([flattened_embeds, padding], axis=0)
+        is_mm_embed_cpu = np.pad(
+            is_mm_embed_cpu, (0, target_pad_len - is_mm_embed_cpu.shape[0]))
+        is_mm_embed = jnp.array(is_mm_embed_cpu, dtype=jnp.bool_)
+        assert flattened_embeds.shape[0] == is_mm_embed.shape[0]
 
-        return flattened_embeds
+        return flattened_embeds, is_mm_embed
