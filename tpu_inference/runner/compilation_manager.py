@@ -88,7 +88,7 @@ class CompilationManager:
         with self.runner.maybe_setup_dummy_loras(
                 self.runner.lora_config), jax.set_mesh(self.runner.mesh):
             self._precompile_backbone_text_only()
-            if self.runner.is_multimodal_model:
+            if self.runner.is_multimodal_model and self.runner.precompile_vision_encoder_fn is not None:
                 self.runner.precompile_vision_encoder_fn(
                     self._run_compilation, )
                 self._precompile_input_embeddings_merger()
