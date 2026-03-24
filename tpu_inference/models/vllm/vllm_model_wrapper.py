@@ -398,6 +398,101 @@ class VllmModelWrapper:
                                 intermediate_tensors=intermediate_tensors, 
                                 inputs_embeds=inputs_embeds, **kwargs)
         vllm_model.forward = patched_forward
+    
+    def _apply_qwen3_omni_patches(self, vllm_model):
+        """Dynamically patch Qwen3 Omni specific methods for TPU/JAX compatibility."""
+        if not hasattr(vllm_model, "config") or "qwen" not in getattr(vllm_model.config, "model_type", "").lower():
+            return
+
+        logger.info("Applying Qwen3-Omni specific torchax patches")
+
+        # Locate the vision transformer
+        vision_model = getattr(vllm_model, "visual", None)
+        if vision_model is None or type(vision_model).__name__ != "Qwen3Omni_VisionTransformer":
+            return
+
+        # 1. Patch rot_pos_emb to cast pos_ids to torchax before indexing
+        # FIX: Added 'self' as the first parameter
+        def patched_rot_pos_emb(self, grid_thw):
+            import torch
+            # Build pos_ids natively on CPU just like the original code
+            pos_ids = []
+            spatial_merge_size = self.spatial_merge_size
+            for t, h, w in grid_thw:
+                hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+                hpos_ids = hpos_ids.reshape(
+                    h // spatial_merge_size, spatial_merge_size,
+                    w // spatial_merge_size, spatial_merge_size,
+                )
+                hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+
+                wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+                wpos_ids = wpos_ids.reshape(
+                    h // spatial_merge_size, spatial_merge_size,
+                    w // spatial_merge_size, spatial_merge_size,
+                )
+                wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
+                pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+            
+            pos_ids = torch.cat(pos_ids, dim=0)
+            max_grid_size = grid_thw[:, 1:].max()
+
+            cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+
+            # --- THE FIX: Convert to torchax before interacting with cos/sin ---
+            if "torchax" in str(type(cos)):
+                import jax
+                from torchax.interop import torch_view
+                # Move to JAX device, cast to int32, and wrap
+                pos_ids_jax = jax.device_put(pos_ids.numpy()).astype(jax.numpy.int32)
+                pos_ids = torch_view(pos_ids_jax)
+            # -------------------------------------------------------------------
+
+            cos_combined = cos[pos_ids].flatten(1)
+            sin_combined = sin[pos_ids].flatten(1)
+
+            return cos_combined, sin_combined
+
+        # Bind the patched method to the instance
+        import types
+        vision_model.rot_pos_emb = types.MethodType(patched_rot_pos_emb, vision_model)
+
+        def make_patched_blk_forward(orig_fn):
+            def patched_blk_forward(self_blk, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, max_seqlen, sequence_lengths):
+                import torch
+                import jax
+                from torchax.interop import torch_view
+
+                def to_torchax(t):
+                    # If it's a raw PyTorch tensor, cast it to JAX
+                    if t is not None and type(t) is torch.Tensor and "torchax" not in str(type(t)):
+                        # Ensure ints become int32 for JAX indexing compatibility
+                        dtype = jax.numpy.int32 if t.dtype in (torch.int32, torch.long) else None
+                        j_arr = jax.device_put(t.cpu().numpy())
+                        if dtype:
+                            j_arr = j_arr.astype(dtype)
+                        return torch_view(j_arr)
+                    return t
+
+                # Intercept and cast the metadata tensors
+                cu_seqlens = to_torchax(cu_seqlens)
+                max_seqlen = to_torchax(max_seqlen)
+                sequence_lengths = to_torchax(sequence_lengths)
+                
+                return orig_fn(
+                    x, 
+                    cu_seqlens=cu_seqlens, 
+                    rotary_pos_emb_cos=rotary_pos_emb_cos, 
+                    rotary_pos_emb_sin=rotary_pos_emb_sin, 
+                    max_seqlen=max_seqlen, 
+                    sequence_lengths=sequence_lengths
+                )
+            return patched_blk_forward
+
+        # Apply the wrapper to every block in the vision model
+        for blk in vision_model.blocks:
+            orig_blk_forward = blk.forward
+            blk.forward = types.MethodType(make_patched_blk_forward(orig_blk_forward), blk)
 
     def load_weights(self):
         loading_start = time.time()
@@ -455,6 +550,7 @@ class VllmModelWrapper:
             with set_current_vllm_config(vllm_config_for_load):
                 vllm_model = vllm_get_model(vllm_config=vllm_config_for_load)
                 self._apply_qwen3_vl_patches(vllm_model)
+                self._apply_qwen3_omni_patches(vllm_model)
         lora_manager = None
         if vllm_config_for_load.lora_config is not None:
             # Replace layers in the model with LoRA layers.
@@ -695,8 +791,13 @@ class VllmModelWrapper:
         if not self.vllm_config.model_config.is_multimodal_model:
             return None
 
-        is_qwen3_vl = type(self.model.vllm_model).__name__ == "Qwen3VLForConditionalGeneration"
-        if is_qwen3_vl:
+        # Check the class name of the underlying model
+        model_name = type(self.model.vllm_model).__name__
+        
+        is_qwen3_vl = model_name == "Qwen3VLForConditionalGeneration"
+        is_qwen3_omni = model_name == "Qwen3OmniMoeThinkerForConditionalGeneration"
+
+        if is_qwen3_vl or is_qwen3_omni:
             return self._wrap_qwen3_vl_embed_input_ids_func()
         else:
             return self._wrap_generic_embed_input_ids_func()
