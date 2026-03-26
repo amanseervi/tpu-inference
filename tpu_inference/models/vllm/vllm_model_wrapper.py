@@ -413,43 +413,61 @@ class VllmModelWrapper:
 
         # 1. Patch rot_pos_emb to cast pos_ids to torchax before indexing
         # FIX: Added 'self' as the first parameter
+        # 1. Patch rot_pos_emb to construct pos_ids purely in NumPy to avoid torchax dispatch crashes
         def patched_rot_pos_emb(self, grid_thw):
-            import torch
-            # Build pos_ids natively on CPU just like the original code
+            import numpy as np
+            import jax
+            from torchax.interop import jax_view, torch_view
+
+            # Extract concrete values safely into a NumPy array
+            try:
+                # If it's a torchax tensor
+                grid_thw_np = np.array(jax_view(grid_thw))
+            except Exception:
+                # If it's a PyTorch tensor
+                grid_thw_np = grid_thw.cpu().numpy()
+
             pos_ids = []
             spatial_merge_size = self.spatial_merge_size
-            for t, h, w in grid_thw:
-                hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            
+            # Perform all positional math in NumPy to evade torchax.default_env() interceptions
+            for t, h, w in grid_thw_np.tolist():
+                t, h, w = int(t), int(h), int(w)
+                
+                # NumPy equivalent of: torch.arange(h).unsqueeze(1).expand(-1, w)
+                hpos_ids = np.broadcast_to(np.arange(h)[:, None], (h, w))
                 hpos_ids = hpos_ids.reshape(
                     h // spatial_merge_size, spatial_merge_size,
-                    w // spatial_merge_size, spatial_merge_size,
+                    w // spatial_merge_size, spatial_merge_size
                 )
-                hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+                hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
 
-                wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+                # NumPy equivalent of: torch.arange(w).unsqueeze(0).expand(h, -1)
+                wpos_ids = np.broadcast_to(np.arange(w)[None, :], (h, w))
                 wpos_ids = wpos_ids.reshape(
                     h // spatial_merge_size, spatial_merge_size,
-                    w // spatial_merge_size, spatial_merge_size,
+                    w // spatial_merge_size, spatial_merge_size
                 )
-                wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
-                pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-            
-            pos_ids = torch.cat(pos_ids, dim=0)
-            max_grid_size = grid_thw[:, 1:].max()
+                wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
 
+                # NumPy equivalent of: torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
+                stacked = np.stack([hpos_ids, wpos_ids], axis=-1)
+                repeated = np.tile(stacked, (t, 1))
+                pos_ids.append(repeated)
+            
+            pos_ids_np = np.concatenate(pos_ids, axis=0)
+            max_grid_size = int(grid_thw_np[:, 1:].max())
+
+            # Get cos and sin (these are pre-computed weights, likely torchax tensors already)
             cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
 
-            # --- THE FIX: Convert to torchax before interacting with cos/sin ---
-            if "torchax" in str(type(cos)):
-                import jax
-                from torchax.interop import torch_view
-                # Move to JAX device, cast to int32, and wrap
-                pos_ids_jax = jax.device_put(pos_ids.numpy()).astype(jax.numpy.int32)
-                pos_ids = torch_view(pos_ids_jax)
-            # -------------------------------------------------------------------
+            # Move our NumPy array to JAX, then wrap it in torchax for the final indexing step
+            pos_ids_jax = jax.device_put(pos_ids_np).astype(jax.numpy.int32)
+            pos_ids_tensor = torch_view(pos_ids_jax)
 
-            cos_combined = cos[pos_ids].flatten(1)
-            sin_combined = sin[pos_ids].flatten(1)
+            # Now index using the finalized tensor
+            cos_combined = cos[pos_ids_tensor].flatten(1)
+            sin_combined = sin[pos_ids_tensor].flatten(1)
 
             return cos_combined, sin_combined
 
