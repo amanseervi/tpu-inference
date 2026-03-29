@@ -122,8 +122,69 @@ class VllmModelWrapper:
         self._apply_pp_patch()
         # Patch sdpa from torch ops to flash attention to prevent OOM
         self._patch_sdpa()
+        self._patch_pad_sequence()
         MultiHeadLatentAttentionWrapper.register_oot(
             VllmTPUMultiHeadLatentAttentionWrapper)
+    
+    def _patch_pad_sequence(self):
+        import torch
+        
+        # Prevent double-patching if the class is re-initialized
+        if getattr(torch.nn.utils.rnn.pad_sequence, "_is_tpu_patched", False):
+            return
+            
+        logger.info("Applying global pure-PyTorch pad_sequence patch for torchax compatibility")
+        
+        def patched_pad_sequence(sequences, batch_first=False, padding_value=0.0, padding_side="right"):
+            """
+            A torchax-safe implementation of pad_sequence using standard tensor slicing.
+            This avoids the opaque torch._C._nn.pad_sequence C++ op that fails on TPU.
+            """
+            if isinstance(sequences, torch.Tensor):
+                sequences = sequences.unbind(0)
+            else:
+                sequences = tuple(sequences)
+                
+            if len(sequences) == 0:
+                raise RuntimeError("pad_sequence: Expected a non-empty list of Tensors")
+                
+            # Find max length and trailing dimensions
+            max_len = max([s.size(0) for s in sequences])
+            num_seqs = len(sequences)
+            trailing_dims = sequences[0].shape[1:]
+            
+            # Initialize the output tensor with the padding value
+            if batch_first:
+                out_dims = (num_seqs, max_len) + trailing_dims
+            else:
+                out_dims = (max_len, num_seqs) + trailing_dims
+                
+            out_tensor = torch.full(
+                out_dims, 
+                padding_value, 
+                dtype=sequences[0].dtype, 
+                device=sequences[0].device
+            )
+            
+            # Fill the tensor using standard slicing (which torchax traces perfectly)
+            for i, tensor in enumerate(sequences):
+                length = tensor.size(0)
+                if batch_first:
+                    if padding_side == "right":
+                        out_tensor[i, :length, ...] = tensor
+                    else: # left
+                        out_tensor[i, max_len - length:, ...] = tensor
+                else:
+                    if padding_side == "right":
+                        out_tensor[:length, i, ...] = tensor
+                    else: # left
+                        out_tensor[max_len - length:, i, ...] = tensor
+                        
+            return out_tensor
+
+        # Tag it and swap it globally
+        patched_pad_sequence._is_tpu_patched = True
+        torch.nn.utils.rnn.pad_sequence = patched_pad_sequence
 
     def _patch_sdpa(self):
         from torchax.ops.jtorch import register_function
