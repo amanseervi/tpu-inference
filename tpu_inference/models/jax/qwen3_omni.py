@@ -13,9 +13,10 @@
 # limitations under the License.
 
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Iterable
 
 import jax
+import torch
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
@@ -133,9 +134,24 @@ class Qwen3OmniThinkerWrapper(JaxModule, LoadableWithIterator):
         else:
             self.lm_head = PPMissingLayer()
             
-    def __call__(self, *args, **kwargs):
-        # Pass forward directly to the text model
-        return self.model(*args, **kwargs)
+    def __call__(
+        self, 
+        kv_caches: List[jax.Array], 
+        input_ids: Optional[jax.Array], 
+        attention_metadata: AttentionMetadata, 
+        inputs_embeds: Optional[jax.Array] = None, 
+        visual_pos_mask: Optional[jax.Array] = None, 
+        deepstack_visual_embeds: Optional[List[jax.Array]] = None
+    ):
+       
+        return self.model(
+            kv_caches=kv_caches,
+            input_ids=input_ids,
+            attention_metadata=attention_metadata,
+            inputs_embeds=inputs_embeds,
+            visual_pos_mask=visual_pos_mask,
+            deepstack_visual_embeds=deepstack_visual_embeds
+        )
         
     def compute_logits(self, hidden_states):
         if hasattr(self, 'lm_head') and not isinstance(self.lm_head, PPMissingLayer):
@@ -184,7 +200,7 @@ class _Qwen3OmniVllmConfigAdapter:
         self.quant_config = vllm_config.quant_config
 
 
-class Qwen3OmniMoeForConditionalGeneration(JaxModule):
+class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
     def __init__(self, vllm_config: VllmConfig, rng: jax.Array, mesh: Mesh):
         self.vllm_config = vllm_config
         self.mesh = mesh
@@ -206,23 +222,28 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule):
         input_ids: jax.Array,
         attention_metadata: AttentionMetadata,
         inputs_embeds: Optional[jax.Array] = None,
-        *args,
+        *args, # Safely trap all of vLLM's extra positional arguments here
         **kwargs,
     ) -> Tuple[List[jax.Array], jax.Array | JaxIntermediateTensors, List[jax.Array]]:
+        
         if (getattr(attention_metadata, "input_positions", None) is not None
                 and attention_metadata.input_positions.ndim == 2
                 and attention_metadata.input_positions.shape[0] == 3):
             attention_metadata.input_positions = attention_metadata.input_positions[0]
 
-        # Delegate to the language model
-        return self.thinker(
-            kv_caches,
-            input_ids,
-            attention_metadata,
-            inputs_embeds,
-            *args,
-            **kwargs,
+        visual_pos_mask = kwargs.get("visual_pos_mask", None)
+        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
+
+        out_kv_caches, hidden_states = self.thinker(
+            kv_caches=kv_caches,
+            input_ids=input_ids,
+            attention_metadata=attention_metadata,
+            inputs_embeds=inputs_embeds,
+            visual_pos_mask=visual_pos_mask,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
+
+        return out_kv_caches, hidden_states, []
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         return self.thinker.compute_logits(hidden_states)
@@ -280,27 +301,24 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule):
         return llm_positions, mrope_position_delta
 
 
-    def load_weights(self, rng_key: jax.Array):
-        from tpu_inference.models.jax.utils.weight_utils import model_weights_generator, JaxAutoWeightsLoader
-
-        weights = getattr(self.vllm_config.model_config, "runai_model_weights_iterator", None)
-        if weights is None:
-            weights = model_weights_generator(
-                model_name_or_path=self.vllm_config.model_config.model,
-                download_dir=self.vllm_config.load_config.download_dir,
-                framework="flax",
-            )
-
-        # Filter out multimodal/talker keys and strip thinker prefix so it matches our model perfectly
-        filtered = []
-        for k, v in weights:
-            if any(x in k for x in ["audio_tower", "talker", "visual", "code2wav"]):
-                continue
-            
-            # Strip "thinker." prefix so keys perfectly match thinker sub-module directly
-            if k.startswith("thinker."):
-                k = k[len("thinker."):]
-            filtered.append((k, v))
-
-        loader = JaxAutoWeightsLoader(self.thinker)
-        return loader.load_weights(filtered)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """
+        Intercept the weights iterator to strip out multi-modal components 
+        (talker, code2wav, visual, audio_tower) until they are implemented.
+        """
+        def text_only_filter(weights_iterator):
+            for name, tensor in weights_iterator:
+                # Only yield weights that belong to the language backbone and LM head
+                if name.startswith("thinker.model.") or name.startswith("thinker.lm_head."):
+                    yield name, tensor
+                else:
+                    # Explicitly dropping: 'talker.*', 'code2wav.*', 'thinker.visual.*', 'thinker.audio_tower.*'
+                    # You can add a debug print here if you want to see exactly what is being dropped:
+                    # print(f"Skipping unimplemented weight: {name}")
+                    pass
+        
+        # Wrap the original iterator with our filter
+        filtered_weights = text_only_filter(weights)
+        
+        # Pass the filtered iterable up to LoadableWithIterator
+        return super().load_weights(filtered_weights)

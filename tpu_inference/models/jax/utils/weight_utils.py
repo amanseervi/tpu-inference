@@ -782,7 +782,8 @@ def jax_array_from_reshaped_torch(
     if permute_dims is not None:
         torch_weight = torch_weight.permute(*permute_dims)
 
-    return ensure_cpu_jax_array(torch_weight)
+    with cpu_mesh_context():
+        return t2j(torch_weight, use_dlpack=False)
 
 
 def assign_and_shard_param(jax_param: nnx.Param,

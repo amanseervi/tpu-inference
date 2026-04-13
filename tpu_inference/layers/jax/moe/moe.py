@@ -31,7 +31,7 @@ from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.weight_utils import (
-    ensure_cpu_jax_array,
+    jax_array_from_reshaped_torch,
     shard_put)
 
 modeling_flax_utils = FlaxUtils()
@@ -264,6 +264,7 @@ class JaxMoE(JaxModule):
 
         self.quant_method might reuse this method if the quantization method has specific logic for loading weights.
         """
+
         cnt = 0
         for param_name, torch_weight in weights:
             cnt += 1
@@ -289,24 +290,9 @@ class JaxMoE(JaxModule):
 
             assert isinstance(jax_param, nnx.Param)
 
-            target_shape = tuple(jax_param.value.shape[1:])
-            source_shape = tuple(torch_weight.shape)
-            if source_shape == target_shape:
-                permute_dims = None
-            elif tuple(reversed(source_shape)) == target_shape:
-                permute_dims = (1, 0)
-            else:
-                raise ValueError(
-                    f"Unexpected {param_type} weight layout for {param_name}: "
-                    f"source {source_shape} vs target {target_shape}")
-
-            with jax.default_device(jax.devices("cpu")[0]):
-                jax_weight = ensure_cpu_jax_array(torch_weight)
-                if permute_dims is not None:
-                    jax_weight = jnp.transpose(jax_weight, permute_dims)
-                if jax_weight.dtype != jax_param.value.dtype:
-                    jax_weight = jax_weight.astype(jax_param.value.dtype)
-                jax_weight = jnp.expand_dims(jax_weight, axis=0)
+            jax_weight = jax_array_from_reshaped_torch(
+                torch_weight, reshape_dims=(1, ) +
+                torch_weight.shape)  # add expert dim for concatenation later
             jax_param._weights_to_load[expert_id] = jax_weight
 
         logger.debug(f"Loaded {cnt} weights for {self.prefix} MoE layer.")
@@ -321,21 +307,10 @@ class JaxMoE(JaxModule):
         }.items():
             weights_to_load = param._weights_to_load
             if all(w is not None for w in weights_to_load):
-                # --- START INJECTED DEBUG ---
-                print(f"\n--- [DEBUG] READY TO CONCATENATE: {self.prefix} {param_name} ---")
-                for i, w in enumerate(weights_to_load):
-                    devices = getattr(w, "devices", lambda: "No devices attr")()
-                    print(f"  [DEBUG] Exp {i}: shape={getattr(w, 'shape', 'none')}, type={type(w)}, devices={devices}")
-                    if i >= 2: # Just print the first 3 experts to avoid flooding the console
-                        print(f"  [DEBUG] ... skipping the rest of the {len(weights_to_load)} experts")
-                        break
-                # --- END INJECTED DEBUG ---
                 with cpu_mesh_context():
                     weights = jnp.concatenate(param._weights_to_load, axis=0)
                 try:
-                    param.value = shard_put(weights,
-                                            param.sharding,
-                                            mesh=self.mesh)
+                    param.value = shard_put(weights, param.sharding)
                     loaded_names.add(param_name)
                 except Exception as e:
                     raise RuntimeError(
