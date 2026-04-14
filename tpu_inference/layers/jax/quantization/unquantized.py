@@ -33,6 +33,18 @@ from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 from tpu_inference.models.jax.utils.weight_utils import shard_put
 
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
+def dump_all_tpu_memory(tag=""):
+    import jax
+    mem_strs = []
+    for d in jax.devices():
+        stats = d.memory_stats()
+        used = stats.get('bytes_in_use', 0) / (1024**2)
+        mem_strs.append(f"D{d.id}:{used:.0f}M")
+    logger.info(f"[MEM-ALL] {tag} | {' '.join(mem_strs)}")
+
 
 class UnquantizedLinearMethod(QuantizeMethodBase,
                               jax_common.UnquantizedLinearMethod):
@@ -127,7 +139,18 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
             # Fuse the weights into w13: [Gate, Up]
             w13_val = jnp.concatenate([w_gate, w_up], axis=1)
+
+            # --- NUCLEAR MEMORY CLEAR 1 ---
+            # Force XLA to drop the TPU memory for the original unsharded weights.
+            w_gate.delete()
+            w_up.delete()
+            # ------------------------------
+
             del w_gate, w_up
+
+            live_arrays = [x for x in jax.live_arrays()]
+            total_bytes = sum(x.nbytes for x in live_arrays)
+            print(f"[DEBUG] Layer {layer.name if hasattr(layer, 'name') else 'MoE'} | Live JAX Arrays: {len(live_arrays)} | Total Size: {total_bytes / (1024**3):.2f} GB")
 
             weights = jax_common.process_unquantized_moe_weights(
                 mesh=jax.sharding.get_mesh(),
@@ -157,6 +180,20 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
             sharded_w13 = shard_put(weights.w13_weight, shardings=edf_spec)
             sharded_w2 = shard_put(weights.w2_weight, shardings=efd_spec)
+
+            sharded_w13 = sharded_w13.block_until_ready()
+            sharded_w2 = sharded_w2.block_until_ready()
+
+            # --- NUCLEAR MEMORY CLEAR 2 ---
+            # Forcefully drop all the massive unsharded intermediates from TPU memory.
+            w13_val.delete()
+            w2_val.delete()
+            weights.w13_weight.delete()
+            weights.w2_weight.delete()
+            # ------------------------------
+
+            dump_all_tpu_memory()
+            
 
             layer.kernel_gating_upproj_EDF = nnx.Param(sharded_w13)
             layer.kernel_down_proj_EFD = nnx.Param(sharded_w2)

@@ -936,6 +936,7 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
         if (quant_method := getattr(module, 'quant_method', None)) is not None:
             assert isinstance(quant_method, QuantizeMethodBase)
             loaded = quant_method.process_weights_after_loading(module)
+            # dump_all_tpu_memory()
             jax.clear_caches()
             assert isinstance(loaded, bool)
             self._process_weights_after_loading_per_module[

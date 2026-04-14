@@ -38,6 +38,7 @@ from tpu_inference.models.jax.qwen3_vl_moe import (
     Qwen3VLMoeDecoderLayer,
     _VllmConfigAdapter,
 )
+from tpu_inference.models.jax.qwen3_vl import Qwen3VLVisionTransformer
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.norm import JaxRmsNorm
@@ -117,9 +118,20 @@ class Qwen3OmniThinkerWrapper(JaxModule, LoadableWithIterator):
         # 1. The MRoPE-aware Text Backbone
         self.model = Qwen3OmniTextModel(vllm_config=vllm_config, rng=nnx.Rngs(rng_key), mesh=mesh)
         
-        # 2. The Language Head
+        # 2. The Vision Tower
         config = vllm_config.model_config.hf_config
         text_config = getattr(config, "text_config", config)
+        
+        self.visual = Qwen3VLVisionTransformer(
+            vllm_config=vllm_config,
+            rngs=nnx.Rngs(rng_key),
+            mesh=mesh,
+            norm_eps=getattr(text_config, "rms_norm_eps", 1e-6),
+            # Note: qwen3_vl might not take a prefix argument directly, 
+            # but it will automatically nest under 'visual' since it's a class attribute here.
+        )
+        
+        # 3. The Language Head
         if not config.tie_word_embeddings:
             vocab_size = vllm_config.model_config.get_vocab_size()
             hidden_size = text_config.hidden_size
@@ -162,15 +174,19 @@ class Qwen3OmniThinkerWrapper(JaxModule, LoadableWithIterator):
 class _Qwen3OmniModelConfigAdapter:
     def __init__(self, hf_config):
         self._hf_config = hf_config
-        self._text_config = getattr(getattr(hf_config, "thinker_config", None),
-                                      "text_config", None)
+        self._thinker_config = getattr(hf_config, "thinker_config", hf_config)
+        self._text_config = getattr(self._thinker_config, "text_config", self._thinker_config)
 
     def __getattr__(self, name):
+        if name == "vision_config":
+            return getattr(self._thinker_config, "vision_config")
+        
         if self._text_config is not None:
             try:
                 return getattr(self._text_config, name)
             except AttributeError:
                 pass
+            
         return getattr(self._hf_config, name)
 
 
@@ -302,23 +318,96 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
 
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
-        """
-        Intercept the weights iterator to strip out multi-modal components 
-        (talker, code2wav, visual, audio_tower) until they are implemented.
-        """
-        def text_only_filter(weights_iterator):
+        from tpu_inference.models.jax.utils.weight_utils import (
+            get_default_maps, _load_and_shard_weight, ensure_cpu_jax_array
+        )
+
+        # 1. Map Omni HF keys directly to Qwen3 VL JAX PyTree paths.
+        mappings = {
+            "thinker.visual.patch_embed.proj": "thinker.visual.patch_embed.proj.kernel",
+            "thinker.visual.patch_embed.proj.bias": "thinker.visual.patch_embed.proj.bias",
+            "thinker.visual.pos_embed": "thinker.visual.pos_embed.embedding",
+            "thinker.visual.blocks.*.attn.qkv": "thinker.visual.blocks.*.attn.qkv_proj.kernel",
+            "thinker.visual.blocks.*.attn.qkv.bias": "thinker.visual.blocks.*.attn.qkv_proj.bias",
+            "thinker.visual.blocks.*.attn.proj": "thinker.visual.blocks.*.attn.proj.kernel",
+            "thinker.visual.blocks.*.attn.proj.bias": "thinker.visual.blocks.*.attn.proj.bias",
+            "thinker.visual.blocks.*.mlp.linear_fc1": "thinker.visual.blocks.*.mlp.fc1.kernel",
+            "thinker.visual.blocks.*.mlp.linear_fc1.bias": "thinker.visual.blocks.*.mlp.fc1.bias",
+            "thinker.visual.blocks.*.mlp.linear_fc2": "thinker.visual.blocks.*.mlp.fc2.kernel",
+            "thinker.visual.blocks.*.mlp.linear_fc2.bias": "thinker.visual.blocks.*.mlp.fc2.bias",
+            "thinker.visual.blocks.*.norm1": "thinker.visual.blocks.*.norm1.scale",
+            "thinker.visual.blocks.*.norm1.bias": "thinker.visual.blocks.*.norm1.bias",
+            "thinker.visual.blocks.*.norm2": "thinker.visual.blocks.*.norm2.scale",
+            "thinker.visual.blocks.*.norm2.bias": "thinker.visual.blocks.*.norm2.bias",
+
+            # --- OMNI MERGER MAPPINGS ---
+            # Omni HF calls it ln_q, mlp.0, mlp.2 -> JAX calls it norm, linear_fc1, linear_fc2
+            "thinker.visual.merger.ln_q": "thinker.visual.merger.norm.scale",
+            "thinker.visual.merger.ln_q.bias": "thinker.visual.merger.norm.bias",
+            "thinker.visual.merger.mlp.0": "thinker.visual.merger.linear_fc1.kernel",
+            "thinker.visual.merger.mlp.0.bias": "thinker.visual.merger.linear_fc1.bias",
+            "thinker.visual.merger.mlp.2": "thinker.visual.merger.linear_fc2.kernel",
+            "thinker.visual.merger.mlp.2.bias": "thinker.visual.merger.linear_fc2.bias",
+        }
+
+        # 2. Dynamically add Deepstack mappings
+        vision_config = self.vllm_config.model_config.hf_config.thinker_config.vision_config
+        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", [8, 16, 24])
+        for i in range(len(deepstack_indexes)):
+            # Omni HF calls it 'merger_list', JAX calls it 'deepstack_merger_list'
+            mappings[f"thinker.visual.merger_list.{i}.ln_q"] = f"thinker.visual.deepstack_merger_list.{i}.norm.scale"
+            mappings[f"thinker.visual.merger_list.{i}.ln_q.bias"] = f"thinker.visual.deepstack_merger_list.{i}.norm.bias"
+            mappings[f"thinker.visual.merger_list.{i}.mlp.0"] = f"thinker.visual.deepstack_merger_list.{i}.linear_fc1.kernel"
+            mappings[f"thinker.visual.merger_list.{i}.mlp.0.bias"] = f"thinker.visual.deepstack_merger_list.{i}.linear_fc1.bias"
+            mappings[f"thinker.visual.merger_list.{i}.mlp.2"] = f"thinker.visual.deepstack_merger_list.{i}.linear_fc2.kernel"
+            mappings[f"thinker.visual.merger_list.{i}.mlp.2.bias"] = f"thinker.visual.deepstack_merger_list.{i}.linear_fc2.bias"
+
+        # 3. Generate default maps, and manually inject transposes for the new MLP keys
+        adapted_model_config = _Qwen3OmniVllmModelConfigAdapter(self.vllm_config.model_config)
+        metadata_map = get_default_maps(adapted_model_config, self.mesh, mappings)
+        
+        # Explicitly tell the loader to transpose (1, 0) for these new Omni dense layers
+        metadata_map.transpose_map["mlp.0"] = (1, 0)
+        metadata_map.transpose_map["mlp.2"] = (1, 0)
+        # 4. Fetch the NNX state and shardings
+        params = nnx.state(self)
+        try:
+            shardings = nnx.get_named_sharding(params, self.mesh)
+        except TypeError:
+            shardings = params
+
+        # 5. The Interceptor logic
+        def intercept_and_filter(weights_iterator):
             for name, tensor in weights_iterator:
-                # Only yield weights that belong to the language backbone and LM head
-                if name.startswith("thinker.model.") or name.startswith("thinker.lm_head."):
+                # Intercept vision tower weights
+                if name.startswith("thinker.visual."):
+                    _load_and_shard_weight(
+                        vllm_config=self.vllm_config,
+                        params=params,
+                        shardings=shardings,
+                        metadata_map=metadata_map,
+                        mesh=self.mesh,
+                        hf_key=name,
+                        hf_weight=ensure_cpu_jax_array(tensor),
+                        keep_hf_weight_suffix_when_match=[],
+                        pp_missing_layers=[], 
+                    )
+                # Pass everything else (like thinker.model.*) to the MoE text loader
+                elif name.startswith("thinker.model") or name == "thinker.lm_head.weight":
                     yield name, tensor
-                else:
-                    # Explicitly dropping: 'talker.*', 'code2wav.*', 'thinker.visual.*', 'thinker.audio_tower.*'
-                    # You can add a debug print here if you want to see exactly what is being dropped:
-                    # print(f"Skipping unimplemented weight: {name}")
-                    pass
+
+        # 6. Pass the *remaining* text/MoE weights down to the automated loader
+        filtered_weights = intercept_and_filter(weights)
         
-        # Wrap the original iterator with our filter
-        filtered_weights = text_only_filter(weights)
+        # Note: We must execute the delegated loader so the generator actually runs!
+        result = super().load_weights(filtered_weights)
         
-        # Pass the filtered iterable up to LoadableWithIterator
-        return super().load_weights(filtered_weights)
+        visual_params_only = {
+            path: value for path, value in params.items() 
+            if "visual" in path  # Only grab the weights we intercepted
+        }
+        
+        # Apply only the visual weights back to the JAX PyTree
+        nnx.update(self, nnx.State(visual_params_only))
+        
+        return result
