@@ -38,7 +38,10 @@ from tpu_inference.models.jax.qwen3_vl_moe import (
     Qwen3VLMoeDecoderLayer,
     _VllmConfigAdapter,
 )
-from tpu_inference.models.jax.qwen3_vl import Qwen3VLVisionTransformer
+from tpu_inference.models.jax.qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLVisionTransformer
+from tpu_inference.models.jax.utils.multi_modal_utils import (
+    merge_multimodal_embeddings,
+)
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.norm import JaxRmsNorm
@@ -216,7 +219,7 @@ class _Qwen3OmniVllmConfigAdapter:
         self.quant_config = vllm_config.quant_config
 
 
-class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
+class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxModule,LoadableWithIterator):
     def __init__(self, vllm_config: VllmConfig, rng: jax.Array, mesh: Mesh):
         self.vllm_config = vllm_config
         self.mesh = mesh
@@ -231,6 +234,16 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
             rng_key=rng,
             mesh=mesh,
         )
+
+        self.config = vllm_config.model_config.hf_config
+        self.visual = self.thinker.visual
+
+        config = vllm_config.model_config.hf_config
+        self.image_token_id = getattr(config, "image_token_id", 151655)
+        self.video_token_id = getattr(config, "video_token_id", 151656)
+        self.vision_start_token_id = getattr(config, "vision_start_token_id", 151652)
+        # Fix this later
+        self.spatial_merge_size = getattr(config, "spatial_merge_size", 2)
 
     def __call__(
         self,
@@ -252,7 +265,7 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
 
         out_kv_caches, hidden_states = self.thinker(
             kv_caches=kv_caches,
-            input_ids=input_ids,
+            input_ids=input_ids if inputs_embeds is None else None,
             attention_metadata=attention_metadata,
             inputs_embeds=inputs_embeds,
             visual_pos_mask=visual_pos_mask,
@@ -264,6 +277,23 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         return self.thinker.compute_logits(hidden_states)
 
+    def get_input_embeddings(
+        self,
+        input_ids: jax.Array,
+        multimodal_embeddings: Optional[jax.Array],
+    ) -> jax.Array:
+        inputs_embeds = self.thinker.model.embed_tokens(input_ids)
+
+        if multimodal_embeddings is not None and multimodal_embeddings.shape[0] != 0:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                multimodal_embeddings,
+                [self.image_token_id, self.video_token_id],
+            )
+
+        return inputs_embeds
+
     def embed_input_ids(
         self,
         input_ids: jax.Array,
@@ -271,13 +301,7 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
         *args,
         **kwargs,
     ) -> jax.Array:
-        # For text-only, we just use the embed_tokens of the language model.
-        # When we add multimodal, we will merge embeddings here.
-        # To allow precompilation for text-only inference, we ignore multimodal_embeddings for now.
-        # When we implement multimodal support, we will merge embeddings here.
-        
-        # In Qwen3MoeForCausalLM, self.thinker is Qwen3MoeModel which has self.embed_tokens
-        return self.thinker.model.embed_tokens(input_ids)
+        return self.get_input_embeddings(input_ids, multimodal_embeddings)
 
     
     def get_multimodal_fns(self):
@@ -400,7 +424,8 @@ class Qwen3OmniMoeForConditionalGeneration(JaxModule,LoadableWithIterator):
         filtered_weights = intercept_and_filter(weights)
         
         # Note: We must execute the delegated loader so the generator actually runs!
-        result = super().load_weights(filtered_weights)
+        # result = super().load_weights(filtered_weights)
+        result = LoadableWithIterator.load_weights(self, filtered_weights)
         
         visual_params_only = {
             path: value for path, value in params.items() 
