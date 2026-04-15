@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import re
-from typing import List, Optional, Tuple, Iterable
+from typing import List, Optional, Tuple, Iterable, Any
 
 import jax
 import torch
@@ -60,6 +60,210 @@ def dump_all_tpu_memory(tag=""):
         used = stats.get('bytes_in_use', 0) / (1024**2)
         mem_strs.append(f"D{d.id}:{used:.0f}M")
     print(f"[MEM-ALL] {tag} | {' '.join(mem_strs)}")
+
+
+
+
+#-------------------------------------------------------------------
+#                       Audio Related parts go here
+#-------------------------------------------------------------------
+
+class SinusoidsPositionEmbedding(nnx.Module):
+    def __init__(self, length: int, channels: int, max_timescale: int = 10000):
+        super().__init__()
+        if channels % 2 != 0:
+            raise ValueError("SinusoidsPositionEmbedding needs even channels input")
+
+        log_timescale_increment = jnp.log(max_timescale) / (channels // 2 - 1)
+        inv_timescales = jnp.exp(-log_timescale_increment * jnp.arange(channels // 2, dtype=jnp.float32))
+        scaled_time = jnp.arange(length, dtype=jnp.float32)[:, jnp.newaxis] * inv_timescales[jnp.newaxis, :]
+        positional_embedding = jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=1)
+        
+        # Storing as a static array attached to the module
+        self.positional_embedding = jnp.array(positional_embedding)
+
+    def __call__(self, seqlen: int) -> jax.Array:
+        return self.positional_embedding[:seqlen, :]
+
+
+class Qwen3OmniMoeAudioAttention(nnx.Module):
+    def __init__(self, config, dtype: jnp.dtype, rngs: nnx.Rngs, prefix: str = ""):
+        self.embed_dim = config.d_model
+        self.num_heads = config.encoder_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scaling = self.head_dim ** -0.5
+
+        # Column Parallel
+        self.qkv = nnx.Linear(
+            self.embed_dim, 
+            self.embed_dim * 3, 
+            use_bias=True, 
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+            bias_init=nnx.with_partitioning(init_fn, ("model", )),
+            rngs=rngs,
+        )
+        # Row Parallel
+        self.out_proj = nnx.Linear(
+            self.embed_dim, 
+            self.embed_dim, 
+            use_bias=True, 
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
+            bias_init=nnx.with_partitioning(init_fn, (None, )),
+            rngs=rngs,
+        )
+
+    def __call__(self, hidden_states: jax.Array, attention_mask: Optional[jax.Array] = None) -> jax.Array:
+        B, S, _ = hidden_states.shape
+        qkv = self.qkv(hidden_states)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        q = q.reshape((B, S, self.num_heads, self.head_dim))
+        k = k.reshape((B, S, self.num_heads, self.head_dim))
+        v = v.reshape((B, S, self.num_heads, self.head_dim))
+
+        # Standard Attention
+        attn_weights = jnp.einsum('bqhd,bkhd->bhqk', q, k) * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+
+        attn_output = jnp.einsum('bhqk,bkhd->bqhd', attn_weights, v)
+        attn_output = attn_output.reshape((B, S, self.embed_dim))
+
+        return self.out_proj(attn_output)
+
+
+class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
+    def __init__(self, config, dtype: jnp.dtype, rngs: nnx.Rngs, prefix: str = ""):
+        self.embed_dim = config.d_model
+        self.self_attn = Qwen3OmniMoeAudioAttention(config, dtype=dtype, rngs=rngs, prefix=f"{prefix}.self_attn")
+        self.self_attn_layer_norm = nnx.LayerNorm(
+            self.embed_dim, 
+            epsilon=1e-5, 
+            dtype=dtype, 
+            rngs=rngs,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            bias_init=nnx.with_partitioning(init_fn, (None,)),
+        )
+        
+        # Column Parallel
+        self.fc1 = nnx.Linear(
+            self.embed_dim, 
+            config.encoder_ffn_dim, 
+            use_bias=True, 
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+            bias_init=nnx.with_partitioning(init_fn, ("model", )),
+            rngs=rngs,
+        )
+        # Row Parallel
+        self.fc2 = nnx.Linear(
+            config.encoder_ffn_dim, 
+            self.embed_dim, 
+            use_bias=True, 
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
+            bias_init=nnx.with_partitioning(init_fn, (None, )),
+            rngs=rngs,
+        )
+        self.final_layer_norm = nnx.LayerNorm(
+            self.embed_dim, 
+            epsilon=1e-5, 
+            dtype=dtype, 
+            rngs=rngs,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            bias_init=nnx.with_partitioning(init_fn, (None,)),
+        )
+        
+        self.activation_fn = jax.nn.gelu
+
+    def __call__(self, hidden_states: jax.Array, attention_mask: Optional[jax.Array] = None) -> jax.Array:
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class Qwen3OmniMoeAudioEncoder(nnx.Module):
+    def __init__(self, config, dtype: jnp.dtype, rngs: nnx.Rngs, prefix: str = ""):
+        self.config = config
+        embed_dim = config.d_model
+        
+        self.positional_embedding = SinusoidsPositionEmbedding(config.max_source_positions, embed_dim)
+
+        self.conv2d1 = nnx.Conv(1, config.downsample_hidden_size, kernel_size=(3, 3), strides=(2, 2), padding=((1, 1), (1, 1)), param_dtype=dtype, rngs=rngs)
+        self.conv2d2 = nnx.Conv(config.downsample_hidden_size, config.downsample_hidden_size, kernel_size=(3, 3), strides=(2, 2), padding=((1, 1), (1, 1)), param_dtype=dtype, rngs=rngs)
+        self.conv2d3 = nnx.Conv(config.downsample_hidden_size, config.downsample_hidden_size, kernel_size=(3, 3), strides=(2, 2), padding=((1, 1), (1, 1)), param_dtype=dtype, rngs=rngs)
+
+        conv_out_dim = config.downsample_hidden_size * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2)
+        self.conv_out = nnx.Linear(conv_out_dim, config.d_model, use_bias=False, param_dtype=dtype, rngs=rngs)
+
+        self.layers = nnx.List([
+            Qwen3OmniMoeAudioEncoderLayer(config, dtype=dtype, rngs=rngs, prefix=f"{prefix}.layers.{i}") 
+            for i in range(config.encoder_layers)
+        ])
+
+        self.ln_post = nnx.LayerNorm(
+            config.d_model, 
+            epsilon=1e-5, 
+            dtype=dtype, 
+            rngs=rngs,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            bias_init=nnx.with_partitioning(init_fn, (None,)),
+        )
+        self.proj1 = nnx.Linear(config.d_model, config.d_model, use_bias=True, param_dtype=dtype, rngs=rngs)
+        self.act = jax.nn.gelu
+        self.proj2 = nnx.Linear(config.d_model, config.output_dim, use_bias=True, param_dtype=dtype, rngs=rngs)
+
+    def __call__(self, input_features: jax.Array) -> jax.Array:
+        if input_features.ndim == 4 and input_features.shape[1] == 1:
+            x = jnp.transpose(input_features, (0, 2, 3, 1))
+        elif input_features.ndim == 3:
+            x = jnp.expand_dims(input_features, axis=-1)
+        else:
+            x = input_features
+
+        x = jax.nn.gelu(self.conv2d1(x))
+        x = jax.nn.gelu(self.conv2d2(x))
+        x = jax.nn.gelu(self.conv2d3(x))
+
+        B, F, T, C = x.shape
+        x = jnp.transpose(x, (0, 2, 3, 1)) 
+        x = x.reshape((B, T, C * F))
+
+        x = self.conv_out(x)
+
+        pos_emb = self.positional_embedding(x.shape[1])
+        x = x + jnp.expand_dims(pos_emb, 0).astype(x.dtype)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.ln_post(x)
+        x = self.proj1(x)
+        x = self.act(x)
+        x = self.proj2(x)
+
+        return x
+
+#-------------------------------------------------------------------
+#                    Audio Encoder Ends
+#-------------------------------------------------------------------
+
+
+
+
 
 class Qwen3OmniTextModel(Qwen3VLMoeTextModel):
     def __init__(self, vllm_config, rng, mesh):
@@ -134,7 +338,16 @@ class Qwen3OmniThinkerWrapper(JaxModule, LoadableWithIterator):
             # but it will automatically nest under 'visual' since it's a class attribute here.
         )
         
-        # 3. The Language Head
+        # 3. The Audio Tower
+        if hasattr(config, "audio_config"):
+            self.audio_tower = Qwen3OmniMoeAudioEncoder(
+                config=config.audio_config,
+                dtype=vllm_config.model_config.dtype,
+                rngs=nnx.Rngs(rng_key),
+                prefix="thinker.audio_tower",
+            )
+            
+        # 4. The Language Head
         if not config.tie_word_embeddings:
             vocab_size = vllm_config.model_config.get_vocab_size()
             hidden_size = text_config.hidden_size
@@ -183,6 +396,8 @@ class _Qwen3OmniModelConfigAdapter:
     def __getattr__(self, name):
         if name == "vision_config":
             return getattr(self._thinker_config, "vision_config")
+        if name == "audio_config":
+            return getattr(self._thinker_config, "audio_config")
         
         if self._text_config is not None:
             try:
@@ -235,7 +450,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
             mesh=mesh,
         )
 
-        self.config = vllm_config.model_config.hf_config
+        self.config = adapted_vllm_config.model_config.hf_config
         self.visual = self.thinker.visual
 
         config = vllm_config.model_config.hf_config
@@ -255,6 +470,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         **kwargs,
     ) -> Tuple[List[jax.Array], jax.Array | JaxIntermediateTensors, List[jax.Array]]:
         
+        #Check this
         if (getattr(attention_metadata, "input_positions", None) is not None
                 and attention_metadata.input_positions.ndim == 2
                 and attention_metadata.input_positions.shape[0] == 3):
@@ -341,6 +557,51 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         return llm_positions, mrope_position_delta
 
 
+    def _buffer_and_load_audio_qkv(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        qkv_buffer: dict,
+        params: nnx.State,
+        shardings: Any,
+        metadata_map: Any,
+    ):
+        from tpu_inference.models.jax.utils.weight_utils import _load_and_shard_weight, ensure_cpu_jax_array
+        
+        parts = name.split(".")
+        layer_idx = parts[3]
+        proj_type = parts[5].split("_")[0] # 'q', 'k', 'v'
+        weight_type = parts[6] # 'weight' or 'bias'
+        
+        key = (layer_idx, weight_type)
+        if key not in qkv_buffer:
+            qkv_buffer[key] = {}
+        qkv_buffer[key][proj_type] = tensor
+        
+        if len(qkv_buffer[key]) == 3:
+            q = qkv_buffer[key]['q']
+            k = qkv_buffer[key]['k']
+            v = qkv_buffer[key]['v']
+            
+            if weight_type == "weight":
+                concatenated = torch.cat([q, k, v], dim=0)
+                new_name = f"thinker.audio_tower.layers.{layer_idx}.self_attn.qkv.weight"
+            else:
+                concatenated = torch.cat([q, k, v], dim=0)
+                new_name = f"thinker.audio_tower.layers.{layer_idx}.self_attn.qkv.bias"
+                
+            _load_and_shard_weight(
+                vllm_config=self.vllm_config,
+                params=params,
+                shardings=shardings,
+                metadata_map=metadata_map,
+                mesh=self.mesh,
+                hf_key=new_name,
+                hf_weight=ensure_cpu_jax_array(concatenated),
+                keep_hf_weight_suffix_when_match=[],
+                pp_missing_layers=[], 
+            )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         from tpu_inference.models.jax.utils.weight_utils import (
             get_default_maps, _load_and_shard_weight, ensure_cpu_jax_array
@@ -365,13 +626,43 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
             "thinker.visual.blocks.*.norm2.bias": "thinker.visual.blocks.*.norm2.bias",
 
             # --- OMNI MERGER MAPPINGS ---
-            # Omni HF calls it ln_q, mlp.0, mlp.2 -> JAX calls it norm, linear_fc1, linear_fc2
             "thinker.visual.merger.ln_q": "thinker.visual.merger.norm.scale",
             "thinker.visual.merger.ln_q.bias": "thinker.visual.merger.norm.bias",
             "thinker.visual.merger.mlp.0": "thinker.visual.merger.linear_fc1.kernel",
             "thinker.visual.merger.mlp.0.bias": "thinker.visual.merger.linear_fc1.bias",
             "thinker.visual.merger.mlp.2": "thinker.visual.merger.linear_fc2.kernel",
             "thinker.visual.merger.mlp.2.bias": "thinker.visual.merger.linear_fc2.bias",
+
+            # --- AUDIO TOWER MAPPINGS ---
+            "thinker.audio_tower.conv2d1": "thinker.audio_tower.conv2d1.kernel",
+            "thinker.audio_tower.conv2d1.bias": "thinker.audio_tower.conv2d1.bias",
+            "thinker.audio_tower.conv2d2": "thinker.audio_tower.conv2d2.kernel",
+            "thinker.audio_tower.conv2d2.bias": "thinker.audio_tower.conv2d2.bias",
+            "thinker.audio_tower.conv2d3": "thinker.audio_tower.conv2d3.kernel",
+            "thinker.audio_tower.conv2d3.bias": "thinker.audio_tower.conv2d3.bias",
+            "thinker.audio_tower.conv_out": "thinker.audio_tower.conv_out.kernel",
+            
+            "thinker.audio_tower.layers.*.self_attn.qkv": "thinker.audio_tower.layers.*.self_attn.qkv.kernel",
+            "thinker.audio_tower.layers.*.self_attn.qkv.bias": "thinker.audio_tower.layers.*.self_attn.qkv.bias",
+            "thinker.audio_tower.layers.*.self_attn.out_proj": "thinker.audio_tower.layers.*.self_attn.out_proj.kernel",
+            "thinker.audio_tower.layers.*.self_attn.out_proj.bias": "thinker.audio_tower.layers.*.self_attn.out_proj.bias",
+            
+            "thinker.audio_tower.layers.*.fc1": "thinker.audio_tower.layers.*.fc1.kernel",
+            "thinker.audio_tower.layers.*.fc1.bias": "thinker.audio_tower.layers.*.fc1.bias",
+            "thinker.audio_tower.layers.*.fc2": "thinker.audio_tower.layers.*.fc2.kernel",
+            "thinker.audio_tower.layers.*.fc2.bias": "thinker.audio_tower.layers.*.fc2.bias",
+            
+            "thinker.audio_tower.layers.*.self_attn_layer_norm": "thinker.audio_tower.layers.*.self_attn_layer_norm.scale",
+            "thinker.audio_tower.layers.*.self_attn_layer_norm.bias": "thinker.audio_tower.layers.*.self_attn_layer_norm.bias",
+            "thinker.audio_tower.layers.*.final_layer_norm": "thinker.audio_tower.layers.*.final_layer_norm.scale",
+            "thinker.audio_tower.layers.*.final_layer_norm.bias": "thinker.audio_tower.layers.*.final_layer_norm.bias",
+            
+            "thinker.audio_tower.ln_post": "thinker.audio_tower.ln_post.scale",
+            "thinker.audio_tower.ln_post.bias": "thinker.audio_tower.ln_post.bias",
+            "thinker.audio_tower.proj1": "thinker.audio_tower.proj1.kernel",
+            "thinker.audio_tower.proj1.bias": "thinker.audio_tower.proj1.bias",
+            "thinker.audio_tower.proj2": "thinker.audio_tower.proj2.kernel",
+            "thinker.audio_tower.proj2.bias": "thinker.audio_tower.proj2.bias",
         }
 
         # 2. Dynamically add Deepstack mappings
@@ -393,6 +684,18 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         # Explicitly tell the loader to transpose (1, 0) for these new Omni dense layers
         metadata_map.transpose_map["mlp.0"] = (1, 0)
         metadata_map.transpose_map["mlp.2"] = (1, 0)
+        
+        audio_transposes = {
+            "thinker.audio_tower.layers.*.self_attn.qkv": (1, 0),
+            "thinker.audio_tower.layers.*.self_attn.out_proj": (1, 0),
+            "thinker.audio_tower.conv2d1": (2, 3, 1, 0),
+            "thinker.audio_tower.conv2d2": (2, 3, 1, 0),
+            "thinker.audio_tower.conv2d3": (2, 3, 1, 0),
+            "thinker.audio_tower.conv_out": (1, 0),
+            "thinker.audio_tower.proj1": (1, 0),
+            "thinker.audio_tower.proj2": (1, 0),
+        }
+        metadata_map.transpose_map = {**audio_transposes, **metadata_map.transpose_map}
         # 4. Fetch the NNX state and shardings
         params = nnx.state(self)
         try:
@@ -401,10 +704,20 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
             shardings = params
 
         # 5. The Interceptor logic
+        qkv_buffer = {}
+        
         def intercept_and_filter(weights_iterator):
             for name, tensor in weights_iterator:
-                # Intercept vision tower weights
-                if name.startswith("thinker.visual."):
+                if name.startswith("thinker.audio_tower.layers.") and (".self_attn.q_proj." in name or ".self_attn.k_proj." in name or ".self_attn.v_proj." in name):
+                    self._buffer_and_load_audio_qkv(
+                        name=name,
+                        tensor=tensor,
+                        qkv_buffer=qkv_buffer,
+                        params=params,
+                        shardings=shardings,
+                        metadata_map=metadata_map,
+                    )
+                elif name.startswith("thinker.visual.") or name.startswith("thinker.audio_tower."):
                     _load_and_shard_weight(
                         vllm_config=self.vllm_config,
                         params=params,
@@ -427,12 +740,12 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         # result = super().load_weights(filtered_weights)
         result = LoadableWithIterator.load_weights(self, filtered_weights)
         
-        visual_params_only = {
+        visual_and_audio_params = {
             path: value for path, value in params.items() 
-            if "visual" in path  # Only grab the weights we intercepted
+            if "visual" in path or "audio_tower" in path
         }
         
-        # Apply only the visual weights back to the JAX PyTree
-        nnx.update(self, nnx.State(visual_params_only))
+        # Apply only the intercepted weights back to the JAX PyTree
+        nnx.update(self, nnx.State(visual_and_audio_params))
         
         return result
