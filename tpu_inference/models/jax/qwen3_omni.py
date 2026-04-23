@@ -62,6 +62,16 @@ def dump_all_tpu_memory(tag=""):
     print(f"[MEM-ALL] {tag} | {' '.join(mem_strs)}")
 
 
+import numpy as np
+def _host_print_stats(name: str, t_np: np.ndarray):
+    """Executes on the CPU/Host with standard numpy arrays for clean logging."""
+    shape_str = f"[{', '.join(map(str, t_np.shape))}]"
+    print(f"{name:<20} | Shape: {shape_str:<15} | Mean: {float(np.mean(t_np)):>8.4f} | Std: {float(np.std(t_np)):>8.4f} | Max: {float(np.max(t_np)):>8.4f} | Min: {float(np.min(t_np)):>8.4f} | NaN: {bool(np.isnan(t_np).any())}")
+
+def jax_print_stats(name: str, t: jax.Array):
+    """Safe to call inside jitted/traced functions."""
+    jax.debug.callback(_host_print_stats, name, t)
+
 
 
 #-------------------------------------------------------------------
@@ -74,16 +84,17 @@ class SinusoidsPositionEmbedding(nnx.Module):
         if channels % 2 != 0:
             raise ValueError("SinusoidsPositionEmbedding needs even channels input")
 
-        log_timescale_increment = jnp.log(max_timescale) / (channels // 2 - 1)
-        inv_timescales = jnp.exp(-log_timescale_increment * jnp.arange(channels // 2, dtype=jnp.float32))
-        scaled_time = jnp.arange(length, dtype=jnp.float32)[:, jnp.newaxis] * inv_timescales[jnp.newaxis, :]
-        positional_embedding = jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=1)
-        
-        # Storing as a static array attached to the module
-        self.positional_embedding = jnp.array(positional_embedding)
+        self.length = length
+        self.channels = channels
+        self.max_timescale = max_timescale
 
     def __call__(self, seqlen: int) -> jax.Array:
-        return self.positional_embedding[:seqlen, :]
+        log_timescale_increment = jnp.log(self.max_timescale) / (self.channels // 2 - 1)
+        inv_timescales = jnp.exp(-log_timescale_increment * jnp.arange(self.channels // 2, dtype=jnp.float32))
+        scaled_time = jnp.arange(self.length, dtype=jnp.float32)[:, jnp.newaxis] * inv_timescales[jnp.newaxis, :]
+        positional_embedding = jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=1)
+        
+        return positional_embedding[:seqlen, :]
 
 
 class Qwen3OmniMoeAudioAttention(nnx.Module):
@@ -114,9 +125,12 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: jax.Array, attention_mask: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, attention_mask: Optional[jax.Array] = None, debug: bool = False) -> jax.Array:
         B, S, _ = hidden_states.shape
         qkv = self.qkv(hidden_states)
+        
+        if debug: jax_print_stats("   -> [Attn] 1. QKV Out", qkv)
+        
         q, k, v = jnp.split(qkv, 3, axis=-1)
 
         q = q.reshape((B, S, self.num_heads, self.head_dim))
@@ -125,14 +139,29 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
 
         # Standard Attention
         attn_weights = jnp.einsum('bqhd,bkhd->bhqk', q, k) * self.scaling
+        if debug: jax_print_stats("   -> [Attn] 2. Logits (Pre-Mask)", attn_weights)
+        
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
+            
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        if debug: jax_print_stats("   -> [Attn] 3. Probs (Softmax)", attn_weights)
 
         attn_output = jnp.einsum('bhqk,bkhd->bqhd', attn_weights, v)
         attn_output = attn_output.reshape((B, S, self.embed_dim))
 
-        return self.out_proj(attn_output)
+        # ---> ADD THESE PRINTS HERE <---
+        if debug: jax_print_stats("   -> [Attn] 2b. Post-Einsum", attn_output)
+        
+        attn_output = attn_output.reshape((B, S, self.embed_dim))
+        
+        if debug: jax_print_stats("   -> [Attn] 2c. Pre-Proj", attn_output)
+
+        out = self.out_proj(attn_output)
+        if debug: jax_print_stats("   -> [Attn] 3. Out Proj", out)
+        
+
+        return out
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
@@ -179,21 +208,33 @@ class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
         
         self.activation_fn = jax.nn.gelu
 
-    def __call__(self, hidden_states: jax.Array, attention_mask: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, attention_mask: Optional[jax.Array] = None, debug: bool = False) -> jax.Array:
         residual = hidden_states
+        
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask)
+        if debug: jax_print_stats("-> [L0] LN1 Out", hidden_states)
+        
+        hidden_states = self.self_attn(hidden_states, attention_mask, debug=debug)
         hidden_states = residual + hidden_states
+        if debug: jax_print_stats("-> [L0] Post-Attn Res", hidden_states)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
+        if debug: jax_print_stats("-> [L0] LN2 Out", hidden_states)
+        
         hidden_states = self.fc1(hidden_states)
+        if debug: jax_print_stats("-> [L0] FC1 Out", hidden_states)
+        
         hidden_states = self.activation_fn(hidden_states)
+        if debug: jax_print_stats("-> [L0] Activation Out", hidden_states)
+        
         hidden_states = self.fc2(hidden_states)
+        if debug: jax_print_stats("-> [L0] FC2 Out", hidden_states)
+        
         hidden_states = residual + hidden_states
+        if debug: jax_print_stats("-> [L0] Final Out", hidden_states)
 
         return hidden_states
-
 
 class Qwen3OmniMoeAudioEncoder(nnx.Module):
     def __init__(self, config, dtype: jnp.dtype, rngs: nnx.Rngs, prefix: str = ""):
@@ -226,36 +267,143 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         self.act = jax.nn.gelu
         self.proj2 = nnx.Linear(config.d_model, config.output_dim, use_bias=True, param_dtype=dtype, rngs=rngs)
 
+    # def __call__(self, input_features: jax.Array) -> jax.Array:
+    #     if input_features.ndim == 4 and input_features.shape[1] == 1:
+    #         x = jnp.transpose(input_features, (0, 2, 3, 1))
+    #     elif input_features.ndim == 3:
+    #         x = jnp.expand_dims(input_features, axis=-1)
+    #     elif input_features.ndim == 2:
+    #         # Handle unbatched 2D inputs (F, T) -> (1, F, T, 1)
+    #         x = jnp.expand_dims(input_features, axis=(0, -1))
+    #     else:
+    #         x = input_features
+        
+    #     jax.debug.print("DEBUG 0 [INPUT]: mean={mean}, std={std}", mean=x.mean(), std=x.std())
+
+    #     x = jax.nn.gelu(self.conv2d1(x))
+    #     x = jax.nn.gelu(self.conv2d2(x))
+    #     x = jax.nn.gelu(self.conv2d3(x))
+
+    #     B, F, T, C = x.shape
+    #     x = jnp.transpose(x, (0, 2, 3, 1)) 
+    #     x = x.reshape((B, T, C * F))
+
+    #     x = self.conv_out(x)
+
+    #     jax.debug.print("DEBUG 1 [POST-CONV]: mean={mean}, std={std}", mean=x.mean(), std=x.std())
+
+    #     pos_emb = self.positional_embedding(x.shape[1])
+    #     x = x + jnp.expand_dims(pos_emb, 0).astype(x.dtype)
+
+    #     jax.debug.print("DEBUG 2 [POST-POSEMB]: mean={mean}, std={std}", mean=x.mean(), std=x.std())
+
+    #     for i, layer in enumerate(self.layers):
+    #         x = layer(x)
+    #         if i == 0: # Just checking the first layer
+    #             jax.debug.print("DEBUG 3 [POST-LAYER-0]: mean={mean}, std={std}", mean=x.mean(), std=x.std())
+
+    #     x = self.ln_post(x)
+    #     x = self.proj1(x)
+    #     x = self.act(x)
+    #     x = self.proj2(x)
+
+    #     jax.debug.print("DEBUG 4 [FINAL-AUDIO-OUT]: mean={mean}, std={std}", mean=x.mean(), std=x.std())
+
+    #     return x
+
     def __call__(self, input_features: jax.Array) -> jax.Array:
-        if input_features.ndim == 4 and input_features.shape[1] == 1:
-            x = jnp.transpose(input_features, (0, 2, 3, 1))
-        elif input_features.ndim == 3:
-            x = jnp.expand_dims(input_features, axis=-1)
-        else:
-            x = input_features
+        # 1. Normalize input to [Freq, Time]
+        x = input_features
+        if x.ndim == 4:
+            x = x[0, 0] if x.shape[1] == 1 else x[0, :, :, 0]
+        elif x.ndim == 3:
+            x = x[0]
+            
+        # Formatting Header
+        jax.debug.print("\n" + "="*80)
+        jax.debug.print("AUDIO ENCODER FULL TRACE DEBUG (JAX)")
+        jax.debug.print("="*80)
 
-        x = jax.nn.gelu(self.conv2d1(x))
-        x = jax.nn.gelu(self.conv2d2(x))
-        x = jax.nn.gelu(self.conv2d3(x))
+        jax_print_stats("0. Input Features", x)
 
-        B, F, T, C = x.shape
-        x = jnp.transpose(x, (0, 2, 3, 1)) 
-        x = x.reshape((B, T, C * F))
+        F, T = x.shape
+        chunk_size = 100
+        
+        # 2. Calculate chunking mathematically
+        num_chunks = (T + chunk_size - 1) // chunk_size
+        pad_len = num_chunks * chunk_size - T
+        
+        # 3. Pad the Time dimension with zeros
+        x_padded = jnp.pad(x, ((0, 0), (0, pad_len)))
+        
+        # 4. Reshape into independent chunks: [Freq, num_chunks, 100]
+        x_chunks = x_padded.reshape((F, num_chunks, chunk_size))
+        
+        # 5. Transpose for Conv2D: [num_chunks, Freq, 100, 1]
+        x_chunks = jnp.transpose(x_chunks, (1, 0, 2))
+        x_chunks = jnp.expand_dims(x_chunks, axis=-1)
+        
+        jax_print_stats("1. Pre-CNN Padded", x_chunks)
 
-        x = self.conv_out(x)
+        # 6. Apply CNN independently to all chunks
+        x_conv = jax.nn.gelu(self.conv2d1(x_chunks))
+        x_conv = jax.nn.gelu(self.conv2d2(x_conv))
+        x_conv = jax.nn.gelu(self.conv2d3(x_conv))
+        
+        # 7. Extract the dimensions: [num_chunks, F_out, T_out, C_out]
+        N, F_out, T_out, C_out = x_conv.shape
+        
+        # 8. Transpose to match PyTorch permute(0, 3, 1, 2) -> [num_chunks, Time, Freq, Channels]
+        x_conv = jnp.transpose(x_conv, (0, 2, 3, 1))
+        
+        # 9. Flatten Freq and Channels
+        x_conv = x_conv.reshape((N, T_out, C_out * F_out))
+        x_conv = self.conv_out(x_conv) # Shape: [num_chunks, T_out, Latent_Dim]
+        
+        jax_print_stats("2. Post-CNN", x_conv)
 
-        pos_emb = self.positional_embedding(x.shape[1])
-        x = x + jnp.expand_dims(pos_emb, 0).astype(x.dtype)
+        # 10. Add Positional Embeddings PER CHUNK
+        pos_emb = self.positional_embedding(T_out)
+        pos_emb_expanded = jnp.expand_dims(pos_emb, 0).astype(x_conv.dtype)
+        
+        jax_print_stats("3. Pos Embeddings", pos_emb_expanded)
+        
+        x_conv = x_conv + pos_emb_expanded
+        jax_print_stats("4. Post Pos-Embed", x_conv)
 
-        for layer in self.layers:
-            x = layer(x)
+        # 11. Flatten the chunks into a single sequence
+        x_flat = x_conv.reshape((N * T_out, -1))
+        
+        # 12. Slice only the valid tokens
+        total_valid = int(_get_feat_extract_output_lengths(jnp.array(T)))
+        x_valid = x_flat[:total_valid, :] 
+        
+        jax_print_stats("5. Hidden (Masked)", x_valid)
 
-        x = self.ln_post(x)
-        x = self.proj1(x)
-        x = self.act(x)
-        x = self.proj2(x)
+        # 13. Add the Batch dimension back for the Transformer Layers
+        x_valid = jnp.expand_dims(x_valid, 0) # Shape: [1, Seq, Dim]
+        
+        # 14. Apply the rest of the tower
+        for i, layer in enumerate(self.layers):
+            x_valid = layer(x_valid, debug=(i == 0))
+            if i == 0:
+                jax_print_stats("6. Post Layer 0", x_valid)
+                
+        jax_print_stats("7. Post All Layers", x_valid)
+            
+        x_valid = self.ln_post(x_valid)
+        jax_print_stats("8. Post LayerNorm", x_valid)
 
-        return x
+        x_valid = self.proj1(x_valid)
+        jax_print_stats("9. Post Proj1", x_valid)
+
+        x_valid = self.act(x_valid)
+        x_valid = self.proj2(x_valid)
+        
+        jax_print_stats("10. FINAL OUTPUT", x_valid)
+        jax.debug.print("="*80 + "\n")
+        
+        return x_valid
 
 #-------------------------------------------------------------------
 #                    Audio Encoder Ends
@@ -434,6 +582,14 @@ class _Qwen3OmniVllmConfigAdapter:
         self.quant_config = vllm_config.quant_config
 
 
+def _get_feat_extract_output_lengths(input_lengths: jax.Array):
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = (
+        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    )
+    return output_lengths
+
 class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxModule,LoadableWithIterator):
     def __init__(self, vllm_config: VllmConfig, rng: jax.Array, mesh: Mesh):
         self.vllm_config = vllm_config
@@ -456,6 +612,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         config = vllm_config.model_config.hf_config
         self.image_token_id = getattr(config, "image_token_id", 151655)
         self.video_token_id = getattr(config, "video_token_id", 151656)
+        self.audio_token_id = getattr(config, "audio_token_id", 151675)
         self.vision_start_token_id = getattr(config, "vision_start_token_id", 151652)
         # Fix this later
         self.spatial_merge_size = getattr(config, "spatial_merge_size", 2)
@@ -499,13 +656,27 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         multimodal_embeddings: Optional[jax.Array],
     ) -> jax.Array:
         inputs_embeds = self.thinker.model.embed_tokens(input_ids)
+        
+        jax.debug.print("DEBUG 5 [INPUT_IDS SHAPE]: {s}", s=input_ids.shape)
 
-        if multimodal_embeddings is not None and multimodal_embeddings.shape[0] != 0:
+        if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
+            # Check the shape of the audio features we are trying to insert
+            jax.debug.print("DEBUG 6 [MM FEAT 0 SHAPE]: {s}", s=multimodal_embeddings[0].shape)
+            
+            # Count how many audio tokens are actually in the prompt
+            audio_tok_count = jnp.sum(input_ids == self.audio_token_id)
+            jax.debug.print("DEBUG 7 [AUDIO TOKENS IN PROMPT]: expected_id={id}, count={c}", id=self.audio_token_id, c=audio_tok_count)
+            
+            # Also check for image/video tokens just in case it got misclassified
+            img_tok_count = jnp.sum(input_ids == self.image_token_id)
+            vid_tok_count = jnp.sum(input_ids == self.video_token_id)
+            jax.debug.print("DEBUG 8 [OTHER TOKENS]: img={i}, vid={v}", i=img_tok_count, v=vid_tok_count)
+
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
                 inputs_embeds,
                 multimodal_embeddings,
-                [self.image_token_id, self.video_token_id],
+                [self.image_token_id, self.video_token_id, self.audio_token_id],
             )
 
         return inputs_embeds
@@ -518,6 +689,68 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         **kwargs,
     ) -> jax.Array:
         return self.get_input_embeddings(input_ids, multimodal_embeddings)
+
+    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
+        from tpu_inference.models.jax.utils.multi_modal_utils import normalize_mm_grid_thw
+        mm_input_by_modality = {}
+        for input_key in kwargs:
+            if input_key in ("pixel_values", "pixel_values_videos", "image_embeds") and "image" not in mm_input_by_modality:
+                image_grid_thw = kwargs.get("image_grid_thw", None)
+                if not image_grid_thw:
+                    image_grid_thw = kwargs.get("video_grid_thw", None)
+                image_grid_thw = normalize_mm_grid_thw(image_grid_thw)
+                
+                mm_input_by_modality["image"] = self._parse_and_validate_image_input(
+                    image_grid_thw, **kwargs)
+                    
+            if input_key == "input_audio_features" and "audio" not in mm_input_by_modality:
+                mm_input_by_modality["audio"] = {
+                    "input_audio_features": kwargs.get("input_audio_features"),
+                    "audio_feature_lengths": kwargs.get("audio_feature_lengths"),
+                }
+        return mm_input_by_modality
+
+    def _process_audio_input(self, audio_input: dict) -> Tuple[jax.Array, ...]:
+        input_audio_features = audio_input.get("input_audio_features")
+        audio_feature_lengths = audio_input.get("audio_feature_lengths")
+        if input_audio_features is None:
+            return ()
+            
+        print(f"DEBUG AUDIO INPUT SHAPE: {input_audio_features.shape}")
+        audio_embeds = self.thinker.audio_tower(input_audio_features)
+        audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
+        
+        B = audio_embeds.shape[0]
+        audio_splits = []
+        for i in range(B):
+            length = int(audio_output_lengths[i]) if hasattr(audio_output_lengths[i], "__int__") else audio_output_lengths[i]
+            audio_splits.append(audio_embeds[i, :length])
+            
+        return tuple(audio_splits)
+
+    def embed_multimodal(self, image_grid_thw=None, **kwargs) -> dict:
+        mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
+        if not mm_input_by_modality:
+            return {}
+
+        multimodal_embeddings: tuple[jax.Array, ...] = ()
+        deepstack_outputs = None
+        
+        for modality in mm_input_by_modality:
+            multimodal_input = mm_input_by_modality[modality]
+            if modality == "image":
+                jax.debug.print("here reached")
+                image_splits, deepstack_by_item = self._process_image_input(multimodal_input)
+                multimodal_embeddings += image_splits
+                if deepstack_by_item is not None:
+                    if deepstack_outputs is None:
+                        deepstack_outputs = []
+                    deepstack_outputs.extend(deepstack_by_item)
+            elif modality == "audio":
+                audio_splits = self._process_audio_input(multimodal_input)
+                multimodal_embeddings += audio_splits
+
+        return {"embeds": multimodal_embeddings, "deepstack": deepstack_outputs}
 
     
     def get_multimodal_fns(self):
@@ -687,7 +920,8 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3VLForConditionalGeneration,JaxMo
         
         audio_transposes = {
             "thinker.audio_tower.layers.*.self_attn.qkv": (1, 0),
-            "thinker.audio_tower.layers.*.self_attn.out_proj": (1, 0),
+            # "thinker.audio_tower.layers.*.self_attn.out_proj": (1, 0),
+            "self_attn.out_proj": (1, 0),
             "thinker.audio_tower.conv2d1": (2, 3, 1, 0),
             "thinker.audio_tower.conv2d2": (2, 3, 1, 0),
             "thinker.audio_tower.conv2d3": (2, 3, 1, 0),
