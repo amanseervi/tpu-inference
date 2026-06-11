@@ -164,6 +164,13 @@ class Gemma4MTPAttention(JaxModule):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self._k_scale = 1.0
+        self._v_scale = 1.0
+        self.kv_cache_quantized_dtype = None
+        if kv_cache_dtype != "auto":
+            self.kv_cache_quantized_dtype = utils.get_jax_dtype_from_str_dtype(
+                kv_cache_dtype
+            )
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.rms_norm_eps = config.rms_norm_eps
@@ -272,6 +279,13 @@ class Gemma4MTPAttention(JaxModule):
         dummy_v = jnp.zeros((num_tokens, self.num_kv_heads, self.head_dim),
                             dtype=q.dtype)
 
+        q_scale = k_scale = v_scale = None
+        if self.kv_cache_quantized_dtype:
+            k_scale = self._k_scale
+            v_scale = self._v_scale
+            dummy_k = dummy_k.astype(self.kv_cache_quantized_dtype)
+            dummy_v = dummy_v.astype(self.kv_cache_quantized_dtype)
+
         new_kv_cache, outputs = attention(
             kv_cache,
             q,
@@ -282,6 +296,9 @@ class Gemma4MTPAttention(JaxModule):
             self.head_dim_original,
             sm_scale=self.scaling,
             attention_chunk_size=self.sliding_window,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             update_kv_cache=False,  # Read-only shared cache query
         )
         o = self.o_proj(outputs)
