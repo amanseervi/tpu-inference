@@ -78,6 +78,11 @@ def calculate_and_store_out(
 ):
 
     def _accum(b_idx: int):
+        if cfgs.debug_mode:
+            @pl.when(step_idx < 4)
+            def _():
+                pl.debug_print(f"  Lane {b_idx}: Step {{}}: Accumulating and storing output", step_idx)
+
         batch_acc = acc_scratch_ref[b_idx]
         batch_l = l_scratch_ref[b_idx]
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -128,6 +133,17 @@ def rpa_body(
 ):
     step = pl.program_id(0)
 
+    if cfgs.debug_mode:
+        @pl.when(step == 0)
+        def _():
+            pl.debug_print("=== RPA Kernel Start ===")
+            pl.debug_print(f"  bq_sz: {cfgs.bq_sz}, bq_c_sz: {cfgs.bq_c_sz}, bkv_sz: {cfgs.bkv_sz}, batch_size: {cfgs.batch_size}")
+            pl.debug_print(f"  mode: {cfgs.mode.symbol}, total_q_tokens: {cfgs.serve.total_q_tokens}, num_seqs: {cfgs.serve.num_seqs}")
+
+        @pl.when(step < 4)
+        def _():
+            pl.debug_print("--- Step {} ---", step)
+
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
@@ -149,6 +165,12 @@ def rpa_body(
         q_end = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx + 1], 0)
         q_len = q_end - q_start
         offset = kv_len - q_len
+
+        if cfgs.debug_mode:
+            @pl.when(step < 4)
+            def _():
+                pl.debug_print(f"  Lane {b_idx}: s_idx={{}}, is_valid={{}}, q_idx={{}}, k_idx={{}}, kv_len={{}}, q_len={{}}",
+                               s_idx, is_valid.astype(jnp.int32), q_idx, k_idx, kv_len, q_len)
 
         processed_q_len.append((q_idx * cfgs.bq_sz + offset).astype(int_ty))
         processed_kv_len.append(k_id.astype(int_ty))

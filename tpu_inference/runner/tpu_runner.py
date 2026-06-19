@@ -2041,8 +2041,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 acc_cur_len += num_scheduled_tokens_per_req[i]
 
                 req_idx = self.input_batch.req_id_to_index[req_id]
-                is_prefill = self.input_batch.num_computed_tokens_cpu[
-                    req_idx] < self.input_batch.num_prompt_tokens[req_idx]
+                num_computed_tokens_pre = (
+                    self.input_batch.num_computed_tokens_cpu[req_idx] -
+                    num_scheduled_tokens_per_req[i]
+                )
+                is_prefill = (
+                    num_computed_tokens_pre <
+                    self.input_batch.num_prompt_tokens[req_idx])
 
                 # We need an explicit `is_prefill` check here because of preemption.
                 # If a request is preempted and immediately resumed, it goes back to
@@ -2069,7 +2074,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 else:
                     max_num_spec_tokens = self.speculative_config.num_speculative_tokens
                     assert num_scheduled_tokens_per_req[
-                        i] <= max_num_spec_tokens + 1
+                        i] <= max_num_spec_tokens + 1, (
+                            f"Expected <= {max_num_spec_tokens + 1} tokens for spec decode request {req_id}, "
+                            f"but got {num_scheduled_tokens_per_req[i]}. "
+                            f"num_computed_tokens_cpu: {self.input_batch.num_computed_tokens_cpu[req_idx]}, "
+                            f"num_computed_tokens_pre: {num_computed_tokens_pre}, "
+                            f"num_prompt_tokens: {self.input_batch.num_prompt_tokens[req_idx]}, "
+                            f"is_prefill: {is_prefill}")
                     idx = self._pre_async_results.placeholder_req_id_to_index[
                         req_id]
 

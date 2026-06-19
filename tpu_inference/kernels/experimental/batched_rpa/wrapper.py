@@ -29,6 +29,7 @@ scheduler.py kernel. Kernel is calculated once and ammortized across different l
 Note: batched_rpa is build on top / derived from RPA3. 
 """
 
+import os
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -37,6 +38,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.experimental.batched_rpa import (configs, kernel,
                                                             schedule, utils)
+
+RPA_DEBUG = os.getenv("RPA_DEBUG", "0") == "1"
 
 
 def prepare_inputs(
@@ -352,6 +355,16 @@ def calculate_block_sizes(
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
+    # Hardcode for speculative verification proof-of-concept
+    if serve_cfgs.total_q_tokens <= 128:
+        prefill_block_sizes = configs.BlockSizes(
+            bq_sz=16,
+            bq_c_sz=16,
+            bkv_sz=512,
+            batch_size=4,
+            n_buffer=3
+        )
+
     return decode_block_sizes, prefill_block_sizes
 
 
@@ -396,7 +409,7 @@ def ragged_paged_attention(
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
-    debug_mode: bool = False,
+    debug_mode: bool | None = None,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
@@ -448,8 +461,9 @@ def ragged_paged_attention(
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
-    if debug_mode:
-        raise ValueError("Debug mode is not supported.")
+    
+    if debug_mode is None:
+        debug_mode = RPA_DEBUG
 
     if out_dtype is None:
         out_dtype = queries.dtype
@@ -510,6 +524,7 @@ def ragged_paged_attention(
             serve=serve_cfgs,
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
+            debug_mode=debug_mode,
         )
         cfgs.validate_inputs(
             q=queries,

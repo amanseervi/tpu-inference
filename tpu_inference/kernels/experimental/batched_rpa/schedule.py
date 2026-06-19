@@ -406,6 +406,12 @@ def rpa_metadata_schedule_kernel(
         max_steps = jnp.maximum(max_steps, lane_lengths_ref[b_idx])
     schedule_ref.actual_steps[0] = max_steps
 
+    if cfgs.debug_mode:
+        pl.debug_print("=== Schedule Kernel ===")
+        pl.debug_print("  max_steps: {}", max_steps)
+        for b_idx in range(cfgs.batch_size):
+            pl.debug_print(f"  Lane {b_idx} length: {{}}", lane_lengths_ref[b_idx])
+
     safe_max_steps = jnp.minimum(max_steps + cfgs.n_buffer + 1,
                                  cfgs.max_steps_ub)
 
