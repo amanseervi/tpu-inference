@@ -19,7 +19,8 @@ from typing import Any, Iterable, List, Optional, Tuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from tpu_inference.kernels.fused_mlp import apply_fused_mlp_with_padding
 from transformers import Gemma4TextConfig
 from vllm.config import VllmConfig
 
@@ -62,6 +63,7 @@ class Gemma4MLP(JaxModule):
                  rng: nnx.Rngs,
                  quant_config: VllmQuantConfig,
                  intermediate_size: int,
+                 mesh: Mesh,
                  prefix: str = ""):
         hidden_size = config.hidden_size
         # `intermediate_size` is the per-layer MLP width. KV-shared layers
@@ -71,29 +73,121 @@ class Gemma4MLP(JaxModule):
         # config.intermediate_size. The caller computes this in
         # Gemma4DecoderLayer and passes it in explicitly.
 
-        self.gate_up_proj = JaxMergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".gate_proj",
-        )
-        self.down_proj = JaxLinear(
-            intermediate_size,
-            hidden_size,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".down_proj",
-        )
-        self.act_fn = partial(nnx.gelu, approximate=True)
+        self.mesh = mesh
+        self.b_inter = 128
+        self.use_fused = (quant_config.__class__.__name__ == "UnquantizedConfig")
+        # Set quant_method to self so process_weights_after_loading is called on this module
+        self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
+        if self.use_fused:
+            self.w_gu = nnx.Param(jnp.zeros((0, 0), dtype=dtype))
+            self.w_d = nnx.Param(jnp.zeros((0, 0), dtype=dtype))
+
+            # Define separate projections for loading
+            self.gate_proj = JaxLinear(
+                hidden_size,
+                intermediate_size,
+                use_bias=False,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".gate_proj",
+            )
+            self.up_proj = JaxLinear(
+                hidden_size,
+                intermediate_size,
+                use_bias=False,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".up_proj",
+            )
+            self.down_proj = JaxLinear(
+                intermediate_size,
+                hidden_size,
+                use_bias=False,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".down_proj",
+            )
+        else:
+            self.gate_up_proj = JaxMergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                use_bias=False,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".gate_proj",
+            )
+            self.down_proj = JaxLinear(
+                intermediate_size,
+                hidden_size,
+                use_bias=False,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".down_proj",
+            )
+            self.act_fn = partial(nnx.gelu, approximate=True)
+
+    def post_load_weights(self):
+        if not self.use_fused:
+            return
+
+        wg = self.gate_proj.weight.value
+        wu = self.up_proj.weight.value
+        wd = self.down_proj.weight.value
+
+        b_inter = self.b_inter
+        hidden_size, local_inter_size = wg.shape
+
+        # Pad local intermediate dimension to a multiple of b_inter
+        pad_inter = (b_inter - (local_inter_size % b_inter)) % b_inter
+        if pad_inter > 0:
+            wg = jnp.pad(wg, ((0, 0), (0, pad_inter)), mode="constant")
+            wu = jnp.pad(wu, ((0, 0), (0, pad_inter)), mode="constant")
+            wd = jnp.pad(wd, ((0, pad_inter), (0, 0)), mode="constant")
+            local_inter_size += pad_inter
+
+        # Combine wg and wu block-by-block
+        num_blocks = local_inter_size // b_inter
+        sharding_3d = NamedSharding(self.mesh, P(None, "model", None))
+        wg_reshaped = jax.lax.reshape(wg, (hidden_size, num_blocks, b_inter))
+        wg_reshaped = jax.lax.with_sharding_constraint(wg_reshaped, sharding_3d)
+        wu_reshaped = jax.lax.reshape(wu, (hidden_size, num_blocks, b_inter))
+        wu_reshaped = jax.lax.with_sharding_constraint(wu_reshaped, sharding_3d)
+
+        w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
+        sharding_2d = NamedSharding(self.mesh, P(None, "model"))
+        w_gu = jax.lax.reshape(w_gu, (hidden_size, local_inter_size * 2))
+        w_gu = jax.lax.with_sharding_constraint(w_gu, sharding_2d)
+
+        # Allocate and set value for w_gu and w_d
+        self.w_gu = nnx.Param(w_gu)
+        self.w_d = nnx.Param(wd)
+
+        # Free original projection modules to save HBM
+        self.gate_proj = None
+        self.up_proj = None
+        self.down_proj = None
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        if self.use_fused and self.w_gu is not None:
+            return apply_fused_mlp_with_padding(
+                x,
+                self.w_gu.value,
+                self.w_d.value,
+                self.mesh,
+                b_inter=self.b_inter,
+            )
+
         gate_up = self.gate_up_proj(x)
         gate, up = jnp.split(gate_up, 2, axis=-1)
         gate = self.act_fn(gate)
@@ -612,6 +706,7 @@ class Gemma4DecoderLayer(JaxModule):
             quant_config=quant_config,
             intermediate_size=layer_intermediate_size,
             prefix=prefix + ".mlp",
+            mesh=mesh,
         )
         self.post_feedforward_layernorm = JaxRmsNorm(
             hidden_size,
@@ -1054,6 +1149,15 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh
 
+        # Enable fused MLP only if unquantized
+        quant_config = vllm_config.quant_config
+        self.use_fused_mlp = (quant_config.__class__.__name__ == "UnquantizedConfig")
+
+        self.packed_modules_mapping = dict(self.packed_modules_mapping)
+        if self.use_fused_mlp:
+            if "gate_up_proj" in self.packed_modules_mapping:
+                del self.packed_modules_mapping["gate_up_proj"]
+
         self.model = Gemma4Model(
             vllm_config=vllm_config,
             rng=rng,
@@ -1081,6 +1185,11 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
             else:
                 self.lm_head = PPMissingLayer()
 
+    def post_load_weights(self):
+        for layer in self.model.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
+                layer.mlp.post_load_weights()
+
     def load_weights(self, weights: Iterable[Tuple[str, Any]]):
         allowed_layers = set(f"layers.{i}."
                              for i in range(len(self.model.layers)))
@@ -1090,10 +1199,13 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
                 "model.", "lm_head")) and
             "vision" not in clean_name  # Exclude vision tower weights for now
         )
-        return super().load_weights(
+        ret = super().load_weights(
             (name, tensor) for name, tensor in stripped_weights
             if not ("layers." in name and not any(
                 layer_prefix in name for layer_prefix in allowed_layers)))
+        if self.use_fused_mlp:
+            self.post_load_weights()
+        return ret
 
     def __call__(
         self,

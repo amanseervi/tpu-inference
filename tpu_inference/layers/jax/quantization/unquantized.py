@@ -337,10 +337,29 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                          self.extra_backend_kwargs)
 
 
+class FusedMLPMethod(QuantizeMethodBase):
+    """Method for Fused MLP layer.
+    """
+
+    def apply_jax(self, layer: JaxModule, *args, **kwargs) -> jax.Array:
+        raise NotImplementedError(
+            "FusedMLPMethod.apply_jax should not be called. "
+            "Use Gemma4MLP.__call__ directly.")
+
+    def process_weights_after_loading(self, layer: JaxModule, *args,
+                                      **kwargs) -> bool:
+        # Do nothing here. Fusion is performed at the end of model loading
+        # in Gemma4ForCausalLM.load_weights to support split checkpoints.
+        return True
+
+
 class UnquantizedConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: JaxModule,
                          prefix: str) -> Optional[QuantizeMethodBase]:
+        # Check for Gemma4MLP (use string check to avoid circular imports)
+        if layer.__class__.__name__ == "Gemma4MLP" and getattr(layer, "use_fused", False):
+            return FusedMLPMethod()
         # JaxMergedColumnParallelLinear is a JaxEinsum subclass whose single
         # kernel fuses several projections; it must report each projection's
         # size via output_sizes so the forward (and weight loading) can

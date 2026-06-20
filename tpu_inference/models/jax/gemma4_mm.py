@@ -581,6 +581,15 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh
 
+        # Enable fused MLP only if unquantized
+        quant_config = vllm_config.quant_config
+        self.use_fused_mlp = (quant_config.__class__.__name__ == "UnquantizedConfig")
+
+        self.packed_modules_mapping = dict(self.packed_modules_mapping)
+        if self.use_fused_mlp:
+            if "gate_up_proj" in self.packed_modules_mapping:
+                del self.packed_modules_mapping["gate_up_proj"]
+
         vllm_config.sharding_config.apply_vision_sharding()
 
         self.model = Gemma4Model(
@@ -630,6 +639,11 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
             else:
                 from tpu_inference.layers.jax.pp_utils import PPMissingLayer
                 self.lm_head = PPMissingLayer()
+
+    def post_load_weights(self):
+        for layer in self.model.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
+                layer.mlp.post_load_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, Any]]):
 
@@ -691,7 +705,10 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
 
                 yield mapped_name, process_tensor(mapped_name, weight)
 
-        return super().load_weights(filter_weights(weights))
+        ret = super().load_weights(filter_weights(weights))
+        if self.use_fused_mlp:
+            self.post_load_weights()
+        return ret
 
     def embed_input_ids(self,
                         input_ids: jax.Array,
