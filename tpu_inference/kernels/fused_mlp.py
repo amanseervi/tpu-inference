@@ -123,7 +123,7 @@ def mlp_kernel_main(x_hbm, w_gu_hbm, wd_hbm, y_hbm, y_scratch, *, b_seq, b_inter
 
 
 @functools.partial(jax.jit, static_argnums=(3, 4, 5))
-def apply_fused_mlp_sharded(
+def apply_fused_mlp_sharded_v1(
     x: jax.Array,
     w_gu: jax.Array,
     wd: jax.Array,
@@ -133,8 +133,8 @@ def apply_fused_mlp_sharded(
 ) -> jax.Array:
     in_specs = (
         P(None, None),  # x
-        P(None, "model"),  # w_gu (combined gate/up weight, sharded along model axis)
-        P("model", None),  # wd (down weight, sharded along model axis)
+        P(None, "model"),  # w_gu
+        P("model", None),  # wd
     )
     out_specs = P(None, None)
 
@@ -182,21 +182,190 @@ def apply_fused_mlp_sharded(
     return local_fused_mlp(x, w_gu, wd)
 
 
+# Fused MLP v2 kernel definition with loop-in-kernel to keep weights in SRAM
+def fused_mlp_v2_kernel(
+    x_ref,
+    w_gu_ref,
+    wd_ref,
+    y_ref,                 # Output 0 (from out_specs)
+    x_scratch_ref,         # Output 1 (from out_specs)
+    sem_ref,               # Output 2 (from out_specs)
+    *,
+    b_seq: int,
+    b_inter: int,
+    local_inter_size: int,
+    hidden_size: int,
+    num_seq_blocks: int,
+    num_inter_blocks: int,
+):
+    def loop_seq(i, _):
+        start_idx = i * b_seq
+        
+        # 1. DMA Copy from HBM (x_ref slice) to VMEM (x_scratch_ref)
+        x_hbm_slice = x_ref.at[pl.ds(start_idx, b_seq), :]
+        dma_read = pltpu.make_async_copy(x_hbm_slice, x_scratch_ref, sem_ref)
+        dma_read.start()
+        dma_read.wait()
+        
+        # Load from VMEM to registers
+        x_tile = x_scratch_ref[...]
+        
+        # Initialize y_tile accumulator in registers to 0
+        y_tile = jnp.zeros((b_seq, hidden_size), dtype=x_ref.dtype)
+
+        # 2. Inner loop over intermediate dimension (unroll=1 prevents unrolling)
+        def loop_inter(j, carry_y):
+            # Load w_gu slice dynamically from VMEM reference to registers
+            w_gu_sram_slice = w_gu_ref[:, pl.ds(j * 2 * b_inter, 2 * b_inter)][...]
+            
+            # Compute Matmul 1: (b_seq, hidden_size) @ (hidden_size, 2 * b_inter) -> (b_seq, 2 * b_inter)
+            hu = jnp.matmul(x_tile, w_gu_sram_slice, preferred_element_type=jnp.float32)
+            
+            # Split and Activate
+            h = hu[:, :b_inter]
+            u = hu[:, b_inter:]
+            a = jax.nn.gelu(h, approximate=True) * u
+            a = a.astype(x_ref.dtype)
+            
+            # Load wd slice dynamically from VMEM reference to registers
+            wd_sram_slice = wd_ref[pl.ds(j * b_inter, b_inter), :][...]
+            
+            # Compute Matmul 2: (b_seq, b_inter) @ (b_inter, hidden_size) -> (b_seq, hidden_size)
+            y_tile_contrib = jnp.matmul(a, wd_sram_slice, preferred_element_type=jnp.float32)
+            
+            # Accumulate
+            return carry_y + y_tile_contrib.astype(carry_y.dtype)
+
+        y_tile_final = jax.lax.fori_loop(0, num_inter_blocks, loop_inter, y_tile, unroll=1)
+        
+        # 3. Store output tile back to HBM via VMEM and DMA
+        x_scratch_ref[...] = y_tile_final
+        
+        y_hbm_slice = y_ref.at[pl.ds(start_idx, b_seq), :]
+        dma_write = pltpu.make_async_copy(x_scratch_ref, y_hbm_slice, sem_ref)
+        dma_write.start()
+        dma_write.wait()
+        
+        return None
+
+    jax.lax.fori_loop(0, num_seq_blocks, loop_seq, None, unroll=1)
+
+
+@functools.partial(jax.jit, static_argnums=(3, 4, 5))
+def apply_fused_mlp_sharded_v2(
+    x: jax.Array,
+    w_gu: jax.Array,
+    wd: jax.Array,
+    mesh: jax.sharding.Mesh,
+    b_seq: int = 128,
+    b_inter: int = 128,
+) -> jax.Array:
+    in_specs = (
+        P(None, None),  # x
+        P(None, "model"),  # w_gu
+        P("model", None),  # wd
+    )
+
+    @functools.partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=P(None, None),
+        check_rep=False,
+    )
+    def local_fused_mlp_v2(x_loc, w_gu_loc, wd_loc):
+        seq_len, hidden_size = x_loc.shape
+        local_inter_size = wd_loc.shape[0]
+        
+        assert seq_len % b_seq == 0, f"seq_len ({seq_len}) must be multiple of b_seq ({b_seq})"
+        num_seq_blocks = seq_len // b_seq
+        num_inter_blocks = local_inter_size // b_inter
+
+        # Block specs:
+        x_spec = pl.BlockSpec(block_shape=(seq_len, hidden_size), index_map=lambda *args: (0, 0), memory_space=pltpu.HBM)
+        y_spec = pl.BlockSpec(block_shape=(seq_len, hidden_size), index_map=lambda *args: (0, 0), memory_space=pltpu.HBM)
+        
+        w_gu_spec = pl.BlockSpec(block_shape=(hidden_size, w_gu_loc.shape[1]), index_map=lambda *args: (0, 0), memory_space=pltpu.VMEM)
+        wd_spec = pl.BlockSpec(block_shape=(local_inter_size, hidden_size), index_map=lambda *args: (0, 0), memory_space=pltpu.VMEM)
+
+        # Workspaces declared in out_shape
+        out_shape = (
+            jax.ShapeDtypeStruct((seq_len, hidden_size), x_loc.dtype), # Actual output y
+            jax.ShapeDtypeStruct((b_seq, hidden_size), x_loc.dtype), # x_scratch in VMEM
+            pltpu.SemaphoreType.DMA(()), # Semaphore
+        )
+        
+        # Workspaces specifications in out_specs
+        x_scratch_spec = pl.BlockSpec(block_shape=(b_seq, hidden_size), index_map=lambda *args: (0, 0), memory_space=pltpu.VMEM)
+        sem_spec = pl.BlockSpec(block_shape=(), index_map=lambda *args: (), memory_space=pltpu.SEMAPHORE)
+        
+        out_specs = (y_spec, x_scratch_spec, sem_spec)
+
+        y_loc, _, _ = pl.pallas_call(
+            functools.partial(
+                fused_mlp_v2_kernel,
+                b_seq=b_seq,
+                b_inter=b_inter,
+                local_inter_size=local_inter_size,
+                hidden_size=hidden_size,
+                num_seq_blocks=num_seq_blocks,
+                num_inter_blocks=num_inter_blocks,
+            ),
+            out_shape=out_shape,
+            in_specs=(x_spec, w_gu_spec, wd_spec),
+            out_specs=out_specs,
+            grid=(1,),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        )(x_loc, w_gu_loc, wd_loc)
+
+        return jax.lax.psum(y_loc, axis_name="model")
+
+    return local_fused_mlp_v2(x, w_gu, wd)
+
+
 def apply_fused_mlp_with_padding(
     x: jax.Array,
     w_gu: jax.Array,
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
-    b_seq: int = 64,
     b_inter: int = 128,
 ) -> jax.Array:
-    """Pads the input sequence length to be a multiple of b_seq if necessary."""
-    seq_len, hidden_size = x.shape
-    rem = seq_len % b_seq
-    if rem == 0:
-        return apply_fused_mlp_sharded(x, w_gu, wd, mesh, b_seq, b_inter)
+    """Hybrid Fused MLP selector.
 
-    pad_len = b_seq - rem
+    For large sequence lengths (prefill), runs a fast unfused merged-projection
+    fallback using standard matmuls. For small sequence lengths (decode),
+    runs the optimized fused MLP v2 kernel with padded sequence blocks
+    to avoid recompilation.
+    """
+    seq_len, hidden_size = x.shape
+
+    # 1. Prefill Fallback: seq_len > 128 uses fast sharded matmuls (compute-bound)
+    if seq_len > 128:
+        in_specs = (P(None, None), P(None, "model"), P("model", None))
+        @functools.partial(
+            shard_map,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=P(None, None),
+            check_rep=False,
+        )
+        def local_unfused(x_loc, w_gu_loc, wd_loc):
+            gate_up = jnp.matmul(x_loc, w_gu_loc)
+            gate, up = jnp.split(gate_up, 2, axis=-1)
+            a = jax.nn.gelu(gate, approximate=True) * up
+            y = jnp.matmul(a, wd_loc)
+            return jax.lax.psum(y, axis_name="model")
+        return local_unfused(x, w_gu, wd)
+
+    # 2. Decode Mode: Pad token count to 64 or 128 to bound compilation shapes
+    target_b_seq = 64 if seq_len <= 64 else 128
+    rem = seq_len % target_b_seq
+
+    if rem == 0:
+        return apply_fused_mlp_sharded_v2(x, w_gu, wd, mesh, b_seq=target_b_seq, b_inter=b_inter)
+
+    pad_len = target_b_seq - rem
     x_padded = jnp.pad(x, ((0, pad_len), (0, 0)), mode="constant")
-    out_padded = apply_fused_mlp_sharded(x_padded, w_gu, wd, mesh, b_seq, b_inter)
+    out_padded = apply_fused_mlp_sharded_v2(x_padded, w_gu, wd, mesh, b_seq=target_b_seq, b_inter=b_inter)
     return out_padded[:seq_len, :]
+

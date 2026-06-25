@@ -74,7 +74,7 @@ class Gemma4MLP(JaxModule):
         # Gemma4DecoderLayer and passes it in explicitly.
 
         self.mesh = mesh
-        self.b_inter = 128
+        self.b_inter = 384
         self.use_fused = (quant_config.__class__.__name__ == "UnquantizedConfig")
         # Set quant_method to self so process_weights_after_loading is called on this module
         self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
